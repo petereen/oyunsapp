@@ -1,4 +1,12 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import {
+  authenticateWithTelegramBrowserCode,
+  authenticateWithTelegramBrowserIdToken,
+  authenticateWithTelegramInitData,
+  fetchTelegramBrowserAuthChallenge,
+  type AuthSession,
+  type TelegramBrowserAuthChallenge,
+} from '../api';
 
 export interface TelegramUser {
   id: number;
@@ -13,12 +21,44 @@ interface AuthState {
   isAuthenticating: boolean;
   authError: string | null;
   token: string | null;
+  needsBrowserLogin: boolean;
+}
+
+interface TelegramLoginCallbackData {
+  id_token?: string;
+  code?: string;
+  code_verifier?: string;
+  redirect_uri?: string;
+  error?: string;
+}
+
+interface TelegramLoginPopupMessage {
+  event?: string;
+  result?: string;
+  error?: string;
+}
+
+interface TelegramLoginSdkResult {
+  id_token?: string;
+  error?: string;
+}
+
+interface TelegramLoginSdkAuthOptions {
+  client_id: number;
+  nonce?: string;
+  lang?: string;
 }
 
 // Extend Window interface for Telegram WebApp
 declare global {
   interface Window {
     Telegram?: {
+      Login?: {
+        auth: (
+          options: TelegramLoginSdkAuthOptions,
+          callback: (result: TelegramLoginSdkResult) => void,
+        ) => void;
+      };
       WebApp?: {
         initData: string;
         initDataUnsafe?: {
@@ -45,7 +85,17 @@ declare global {
 const JWT_STORAGE_KEY = 'oyuns_jwt_v2';
 const USER_STORAGE_KEY = 'oyuns_user_v2';
 const INIT_DATA_STORAGE_KEY = 'oyuns_init_data_v2'; // cached for menu-button / refresh reopens
+const LAST_ACTIVE_AT_STORAGE_KEY = 'oyuns_last_active_at_v1';
+const MAX_INACTIVITY_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+const ACTIVITY_WRITE_THROTTLE_MS = 60 * 1000; // write at most once per minute
 const DEV_MODE = import.meta.env.VITE_DEV_MODE === 'true';
+const LANG_STORAGE_KEY = 'oyuns_lang';
+const TELEGRAM_LOGIN_ORIGIN = 'https://oauth.telegram.org';
+const TELEGRAM_LOGIN_URL = `${TELEGRAM_LOGIN_ORIGIN}/auth`;
+const TELEGRAM_LOGIN_REDIRECT_URI = import.meta.env.VITE_TELEGRAM_LOGIN_REDIRECT_URI?.trim();
+const TELEGRAM_LOGIN_SDK_URL = 'https://oauth.telegram.org/js/telegram-login.js?25';
+
+let telegramLoginSdkPromise: Promise<void> | null = null;
 
 // When telegram-web-app.js fails to load (ERR_CONNECTION_CLOSED), the SDK never parses
 // the URL hash. Extract initData from the hash directly as a fallback.
@@ -60,6 +110,301 @@ function getInitDataFromHash(): string {
   }
 }
 
+function getStoredLang(): 'mn' | 'ru' | undefined {
+  const stored = localStorage.getItem(LANG_STORAGE_KEY);
+  if (stored === 'mn' || stored === 'ru') {
+    return stored;
+  }
+  return undefined;
+}
+
+function createSignedOutState(overrides: Partial<AuthState> = {}): AuthState {
+  return {
+    initData: '',
+    user: null,
+    isAuthenticating: false,
+    authError: null,
+    token: null,
+    needsBrowserLogin: false,
+    ...overrides,
+  };
+}
+
+function normalizeBrowserLoginError(error: unknown): string {
+  const message = error instanceof Error ? error.message : 'Telegram browser login failed';
+  if (message === 'access_denied' || message === 'popup_closed') {
+    return 'Telegram login was cancelled. Please try again.';
+  }
+  if (message === 'popup_blocked') {
+    return 'Please allow popups and try again.';
+  }
+  if (message === 'telegram_login_timeout') {
+    return 'Telegram login timed out. Please try again.';
+  }
+  if (message.toLowerCase().includes('redirect_uri required')) {
+    return 'Telegram login error. Please try again later.';
+  }
+  return 'Login failed. Please try again.';
+}
+
+function getTelegramLoginRedirectUri(): string {
+  if (TELEGRAM_LOGIN_REDIRECT_URI) {
+    return TELEGRAM_LOGIN_REDIRECT_URI;
+  }
+  return new URL(import.meta.env.BASE_URL || '/', window.location.origin).toString();
+}
+
+function toBase64Url(bytes: Uint8Array): string {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += 1) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function randomBase64Url(byteLength: number): string {
+  const bytes = new Uint8Array(byteLength);
+  crypto.getRandomValues(bytes);
+  return toBase64Url(bytes);
+}
+
+async function sha256Base64Url(input: string): Promise<string> {
+  const encoded = new TextEncoder().encode(input);
+  const digest = await crypto.subtle.digest('SHA-256', encoded);
+  return toBase64Url(new Uint8Array(digest));
+}
+
+async function createPkcePair(): Promise<{ codeVerifier: string; codeChallenge: string }> {
+  const codeVerifier = randomBase64Url(64);
+  const codeChallenge = await sha256Base64Url(codeVerifier);
+  return { codeVerifier, codeChallenge };
+}
+
+function buildTelegramLoginUrl(
+  challenge: TelegramBrowserAuthChallenge,
+  codeChallenge: string,
+  state: string,
+): { url: string; redirectUri: string } {
+  const redirectUri = getTelegramLoginRedirectUri();
+  const params = new URLSearchParams({
+    response_type: 'code',
+    client_id: challenge.client_id,
+    redirect_uri: redirectUri,
+    scope: 'openid profile',
+    state,
+    code_challenge: codeChallenge,
+    code_challenge_method: 'S256',
+  });
+  params.set('nonce', challenge.nonce);
+
+  const lang = getStoredLang();
+  if (lang) {
+    params.set('lang', lang);
+  }
+
+  return {
+    url: `${TELEGRAM_LOGIN_URL}?${params.toString()}`,
+    redirectUri,
+  };
+}
+
+function getTelegramLoginPopupFeatures(): string {
+  const width = 550;
+  const height = 650;
+  const left = Math.max(0, Math.round(window.screenX + (window.outerWidth - width) / 2));
+  const top = Math.max(0, Math.round(window.screenY + (window.outerHeight - height) / 2));
+
+  return [
+    `width=${width}`,
+    `height=${height}`,
+    `left=${left}`,
+    `top=${top}`,
+    'status=0',
+    'location=0',
+    'menubar=0',
+    'toolbar=0',
+  ].join(',');
+}
+
+function loadTelegramLoginSdk(): Promise<void> {
+  if (window.Telegram?.Login?.auth) {
+    return Promise.resolve();
+  }
+
+  if (telegramLoginSdkPromise) {
+    return telegramLoginSdkPromise;
+  }
+
+  telegramLoginSdkPromise = new Promise((resolve, reject) => {
+    const existingScript = document.querySelector<HTMLScriptElement>('script[data-telegram-login-sdk="true"]');
+    if (existingScript) {
+      existingScript.addEventListener('load', () => resolve(), { once: true });
+      existingScript.addEventListener('error', () => reject(new Error('Failed to load Telegram Login SDK')), { once: true });
+      return;
+    }
+
+    const script = document.createElement('script');
+    script.src = TELEGRAM_LOGIN_SDK_URL;
+    script.async = true;
+    script.defer = true;
+    script.dataset.telegramLoginSdk = 'true';
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error('Failed to load Telegram Login SDK'));
+    document.head.appendChild(script);
+  });
+
+  return telegramLoginSdkPromise;
+}
+
+async function openTelegramLoginWithSdk(challenge: TelegramBrowserAuthChallenge): Promise<TelegramLoginCallbackData> {
+  await loadTelegramLoginSdk();
+
+  const auth = window.Telegram?.Login?.auth;
+  if (!auth) {
+    throw new Error('Telegram Login SDK is unavailable');
+  }
+
+  const clientId = Number(challenge.client_id);
+  if (!Number.isFinite(clientId) || clientId <= 0) {
+    throw new Error('Invalid Telegram client_id');
+  }
+
+  const lang = getStoredLang();
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timeoutId = window.setTimeout(() => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      reject(new Error('telegram_login_timeout'));
+    }, 30000);
+
+    auth(
+      {
+        client_id: clientId,
+        nonce: challenge.nonce,
+        ...(lang ? { lang } : {}),
+      },
+      (result) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        window.clearTimeout(timeoutId);
+
+        if (result?.error) {
+          reject(new Error(result.error));
+          return;
+        }
+        if (!result?.id_token) {
+          reject(new Error('Telegram login did not return an id_token'));
+          return;
+        }
+        resolve({ id_token: result.id_token });
+      },
+    );
+  });
+}
+
+function openTelegramLoginPopup(challenge: TelegramBrowserAuthChallenge): Promise<TelegramLoginCallbackData> {
+  return new Promise(async (resolve, reject) => {
+    const { codeVerifier, codeChallenge } = await createPkcePair();
+    const state = randomBase64Url(24);
+    const { url, redirectUri } = buildTelegramLoginUrl(challenge, codeChallenge, state);
+
+    let popup: Window | null = null;
+    let settled = false;
+    let closeCheck: number | null = null;
+
+    const cleanup = () => {
+      if (closeCheck !== null) {
+        window.clearInterval(closeCheck);
+      }
+    };
+
+    const finish = (result?: TelegramLoginCallbackData, error?: Error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+
+      if (popup && !popup.closed) {
+        popup.close();
+      }
+
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      if (!result?.code || !result.code_verifier || !result.redirect_uri) {
+        reject(new Error('Telegram login did not return an authorization code'));
+        return;
+      }
+
+      resolve(result);
+    };
+
+    popup = window.open(
+      url,
+      'telegram_oidc_login',
+      getTelegramLoginPopupFeatures(),
+    );
+
+    if (!popup) {
+      cleanup();
+      reject(new Error('popup_blocked'));
+      return;
+    }
+
+    popup.focus();
+    closeCheck = window.setInterval(() => {
+      if (!popup) {
+        return;
+      }
+      if (popup.closed) {
+        finish(undefined, new Error('popup_closed'));
+        return;
+      }
+
+      try {
+        const popupUrl = new URL(popup.location.href);
+        if (popupUrl.origin !== window.location.origin) {
+          return;
+        }
+
+        const error = popupUrl.searchParams.get('error');
+        if (error) {
+          const errorDescription = popupUrl.searchParams.get('error_description');
+          finish(undefined, new Error(errorDescription || error));
+          return;
+        }
+
+        const authCode = popupUrl.searchParams.get('code');
+        const returnedState = popupUrl.searchParams.get('state');
+        if (!authCode) {
+          return;
+        }
+        if (returnedState && returnedState !== state) {
+          finish(undefined, new Error('Telegram login state mismatch'));
+          return;
+        }
+
+        finish({
+          code: authCode,
+          code_verifier: codeVerifier,
+          redirect_uri: redirectUri,
+        });
+      } catch {
+        // Expected while popup is still on Telegram origin.
+      }
+    }, 200);
+  });
+}
+
 // Default dev user for local testing without Telegram
 const DEV_USER: TelegramUser = {
   id: 1932946217,
@@ -69,13 +414,50 @@ const DEV_USER: TelegramUser = {
 };
 
 export function useTelegramAuth() {
+  const lastActivityWriteRef = useRef(0);
   const [state, setState] = useState<AuthState>({
-    initData: '',
-    user: null,
+    ...createSignedOutState(),
     isAuthenticating: true,
-    authError: null,
-    token: null,
   });
+
+  const touchActivity = useCallback((force = false) => {
+    const now = Date.now();
+    if (!force && now - lastActivityWriteRef.current < ACTIVITY_WRITE_THROTTLE_MS) {
+      return;
+    }
+    lastActivityWriteRef.current = now;
+    localStorage.setItem(LAST_ACTIVE_AT_STORAGE_KEY, String(now));
+  }, []);
+
+  const clearStoredAuth = useCallback(() => {
+    localStorage.removeItem(JWT_STORAGE_KEY);
+    localStorage.removeItem(USER_STORAGE_KEY);
+    localStorage.removeItem(INIT_DATA_STORAGE_KEY);
+    localStorage.removeItem(LAST_ACTIVE_AT_STORAGE_KEY);
+  }, []);
+
+  const applyAuthenticatedState = useCallback((authData: AuthSession, initData = '') => {
+    localStorage.setItem(JWT_STORAGE_KEY, authData.token);
+    localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(authData.user));
+    if (initData && !initData.startsWith('dev_mode_bypass')) {
+      localStorage.setItem(INIT_DATA_STORAGE_KEY, initData);
+    }
+
+    setState(createSignedOutState({
+      initData,
+      user: authData.user,
+      token: authData.token,
+    }));
+    touchActivity(true);
+  }, [touchActivity]);
+
+  const requireBrowserLogin = useCallback((authError: string | null = null) => {
+    clearStoredAuth();
+    setState(createSignedOutState({
+      authError,
+      needsBrowserLogin: true,
+    }));
+  }, [clearStoredAuth]);
 
   const authenticate = useCallback(async (initData: string) => {
     try {
@@ -97,38 +479,9 @@ export function useTelegramAuth() {
       } catch (e) {
         console.warn('Debug endpoint failed:', e);
       }
-      
-      const response = await fetch(
-        (import.meta.env.VITE_API_BASE || '/api') + '/auth',
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ init_data: initData }),
-        }
-      );
 
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(errorData.detail || `Auth failed: ${response.status}`);
-      }
-
-      const data = await response.json();
-      
-      // Store JWT and user in localStorage
-      localStorage.setItem(JWT_STORAGE_KEY, data.token);
-      localStorage.setItem(USER_STORAGE_KEY, JSON.stringify(data.user));
-      // Cache initData so menu-button / refresh reopens can replay it when Telegram sends empty initData
-      if (!initData.startsWith('dev_mode_bypass')) {
-        localStorage.setItem(INIT_DATA_STORAGE_KEY, initData);
-      }
-
-      setState({
-        initData,
-        user: data.user,
-        isAuthenticating: false,
-        authError: null,
-        token: data.token,
-      });
+      const data = await authenticateWithTelegramInitData(initData);
+      applyAuthenticatedState(data, initData);
 
       console.log('✅ Telegram auth successful:', data.user);
       return data;
@@ -144,7 +497,76 @@ export function useTelegramAuth() {
       
       throw error;
     }
-  }, []);
+  }, [applyAuthenticatedState]);
+
+  const startBrowserLogin = useCallback(async () => {
+    setState(prev => ({
+      ...prev,
+      isAuthenticating: true,
+      authError: null,
+      needsBrowserLogin: true,
+    }));
+
+    try {
+      const challenge = await fetchTelegramBrowserAuthChallenge();
+      let loginResult: TelegramLoginCallbackData;
+
+      const preferManualFlow = Boolean(TELEGRAM_LOGIN_REDIRECT_URI);
+
+      if (preferManualFlow) {
+        try {
+          loginResult = await openTelegramLoginPopup(challenge);
+        } catch (manualError) {
+          const manualMessage = manualError instanceof Error ? manualError.message : '';
+          if (manualMessage === 'popup_blocked') {
+            console.warn('Manual Telegram popup blocked; trying SDK flow:', manualError);
+            loginResult = await openTelegramLoginWithSdk(challenge);
+          } else {
+            throw manualError;
+          }
+        }
+      } else {
+        try {
+          loginResult = await openTelegramLoginWithSdk(challenge);
+        } catch (sdkError) {
+          const sdkErrorMessage = sdkError instanceof Error ? sdkError.message : '';
+          const canFallback =
+            sdkErrorMessage.includes('SDK is unavailable') ||
+            sdkErrorMessage.includes('Failed to load Telegram Login SDK') ||
+            sdkErrorMessage === 'popup_blocked';
+
+          if (!canFallback) {
+            throw sdkError;
+          }
+
+          console.warn('Telegram Login SDK unavailable/blocked, falling back to manual popup OAuth URL:', sdkError);
+          loginResult = await openTelegramLoginPopup(challenge);
+        }
+      }
+
+      let authData: AuthSession;
+      if (loginResult.id_token) {
+        authData = await authenticateWithTelegramBrowserIdToken(loginResult.id_token);
+      } else if (loginResult.code && loginResult.code_verifier && loginResult.redirect_uri) {
+        authData = await authenticateWithTelegramBrowserCode({
+          code: loginResult.code,
+          code_verifier: loginResult.code_verifier,
+          redirect_uri: loginResult.redirect_uri,
+        });
+      } else {
+        throw new Error('Telegram login returned neither id_token nor authorization code');
+      }
+
+      applyAuthenticatedState(authData);
+      console.log('✅ Telegram browser login successful:', authData.user);
+      return authData;
+    } catch (error) {
+      const errorMessage = normalizeBrowserLoginError(error);
+      console.error('❌ Telegram browser login failed:', errorMessage);
+      requireBrowserLogin(errorMessage);
+      return null;
+    }
+  }, [applyAuthenticatedState, requireBrowserLogin]);
 
   useEffect(() => {
     const initAuth = async () => {
@@ -178,21 +600,93 @@ export function useTelegramAuth() {
       // PRIORITY 1: Live initData from SDK or URL hash (we are inside Telegram Mini App)
       if (liveInitData) {
         console.log('📱 Real Telegram WebApp detected! Using initData for authentication...');
-        // Clear any old dev mode tokens to force fresh auth with real user
-        localStorage.removeItem(JWT_STORAGE_KEY);
-        localStorage.removeItem(USER_STORAGE_KEY);
-        // Don't remove INIT_DATA_STORAGE_KEY here — we're about to overwrite it on success
-        
+
         try {
           await authenticate(liveInitData);
           return;
         } catch {
-          // Auth failed, error already set in state
-          return;
+          // If initData auth fails, continue with stored session fallback for browser users.
+          console.warn('⚠️ initData authentication failed, attempting stored session fallback...');
         }
       }
 
-      // PRIORITY 2: Telegram context exists but initData is EMPTY (menu button / page refresh on mobile).
+      const storedToken = localStorage.getItem(JWT_STORAGE_KEY);
+      const storedUser = localStorage.getItem(USER_STORAGE_KEY);
+
+      // PRIORITY 2: Check for existing valid JWT token (no live Telegram initData available)
+      if (storedToken && storedUser) {
+        const lastActiveRaw = localStorage.getItem(LAST_ACTIVE_AT_STORAGE_KEY);
+        const lastActiveAt = lastActiveRaw ? Number(lastActiveRaw) : Date.now();
+        if (!Number.isFinite(lastActiveAt) || Date.now() - lastActiveAt > MAX_INACTIVITY_MS) {
+          console.log('⏰ Stored auth expired due to inactivity; forcing browser login');
+          clearStoredAuth();
+          setState(createSignedOutState({
+            needsBrowserLogin: true,
+            authError: 'Session expired after inactivity. Sign in again.',
+          }));
+          return;
+        }
+
+        try {
+          const user = JSON.parse(storedUser) as TelegramUser;
+          // Don't use cached dev user (id 1932946217) in production
+          if (!DEV_MODE && user.id === DEV_USER.id) {
+            console.log('🚫 Clearing cached dev user in production mode');
+            localStorage.removeItem(JWT_STORAGE_KEY);
+            localStorage.removeItem(USER_STORAGE_KEY);
+          } else {
+            // Validate the stored JWT by making a lightweight request to /api/me
+            // This prevents blindly trusting an expired/invalid token
+            console.log('🔍 Validating stored JWT token before restoring session...');
+            try {
+              const apiBase = import.meta.env.VITE_API_BASE || '/api';
+              const validateRes = await fetch(`${apiBase}/me`, {
+                headers: { Authorization: `Bearer ${storedToken}` },
+                credentials: 'same-origin',
+              });
+
+              if (validateRes.ok) {
+                // Token is valid — restore session normally
+                setState({
+                  ...createSignedOutState({
+                    user,
+                    token: storedToken,
+                  }),
+                });
+                touchActivity(true);
+                console.log('✅ JWT validated, restored auth from localStorage:', user);
+                return;
+              } else {
+                // Token is invalid (expired or secret changed) — don't clear localStorage yet,
+                // just show login prompt so user can re-authenticate
+                console.warn('⚠️ Stored JWT token is invalid (server returned ' + validateRes.status + '), showing login prompt');
+                setState(createSignedOutState({
+                  needsBrowserLogin: true,
+                  authError: 'Your session has expired. Please sign in again.',
+                }));
+                return;
+              }
+            } catch {
+              // Network error — still restore session, let the interceptor handle later failures
+              console.warn('⚠️ Could not validate JWT token (network error), restoring session and retrying...');
+              setState({
+                ...createSignedOutState({
+                  user,
+                  token: storedToken,
+                }),
+              });
+              touchActivity(true);
+              return;
+            }
+          }
+        } catch {
+          // Invalid stored data, clear and re-authenticate
+          localStorage.removeItem(JWT_STORAGE_KEY);
+          localStorage.removeItem(USER_STORAGE_KEY);
+        }
+      }
+
+      // PRIORITY 3: Telegram context exists but initData is EMPTY (menu button / page refresh on mobile).
       // Replay the cached initData from the last successful real auth.
       if (tg && (!tg.initData || tg.initData.length === 0)) {
         const cachedInitData = localStorage.getItem(INIT_DATA_STORAGE_KEY);
@@ -205,39 +699,7 @@ export function useTelegramAuth() {
             // Cached initData expired or invalid — clear it and fall through
             console.warn('⚠️ Cached initData auth failed, clearing cache');
             localStorage.removeItem(INIT_DATA_STORAGE_KEY);
-            localStorage.removeItem(JWT_STORAGE_KEY);
-            localStorage.removeItem(USER_STORAGE_KEY);
           }
-        }
-      }
-
-      // PRIORITY 3: Check for existing valid JWT token (no live Telegram initData available)
-      const storedToken = localStorage.getItem(JWT_STORAGE_KEY);
-      const storedUser = localStorage.getItem(USER_STORAGE_KEY);
-      
-      if (storedToken && storedUser) {
-        try {
-          const user = JSON.parse(storedUser) as TelegramUser;
-          // Don't use cached dev user (id 1932946217) in production
-          if (!DEV_MODE && user.id === DEV_USER.id) {
-            console.log('🚫 Clearing cached dev user in production mode');
-            localStorage.removeItem(JWT_STORAGE_KEY);
-            localStorage.removeItem(USER_STORAGE_KEY);
-          } else {
-            setState({
-              initData: '',
-              user,
-              isAuthenticating: false,
-              authError: null,
-              token: storedToken,
-            });
-            console.log('✅ Restored auth from localStorage:', user);
-            return;
-          }
-        } catch {
-          // Invalid stored data, clear and re-authenticate
-          localStorage.removeItem(JWT_STORAGE_KEY);
-          localStorage.removeItem(USER_STORAGE_KEY);
         }
       }
 
@@ -255,58 +717,116 @@ export function useTelegramAuth() {
         } catch {
           // Fallback to mock user without server auth
           setState({
-            initData: '',
-            user: devUser,
-            isAuthenticating: false,
-            authError: null,
-            token: null,
+            ...createSignedOutState({ user: devUser }),
           });
         }
         return;
       }
 
-      // PRIORITY 5: Production without Telegram context - show error
-      console.error('❌ No Telegram context and not in dev mode');
-      setState({
-        initData: '',
-        user: null,
-        isAuthenticating: false,
-        authError: 'Telegram-ээс нээнэ үү / Please open from Telegram',
-        token: null,
-      });
+      // PRIORITY 5: Production without Telegram context - show Telegram browser login
+      console.log('🌐 No Telegram initData available. Waiting for browser login...');
+      setState(createSignedOutState({ needsBrowserLogin: true }));
     };
 
     initAuth();
-  }, [authenticate]);
+  }, [authenticate, clearStoredAuth, touchActivity]);
 
   // Function to clear auth (logout)
   const clearAuth = useCallback(() => {
-    localStorage.removeItem(JWT_STORAGE_KEY);
-    localStorage.removeItem(USER_STORAGE_KEY);
-    localStorage.removeItem(INIT_DATA_STORAGE_KEY);
-    setState({
-      initData: '',
-      user: null,
-      isAuthenticating: false,
-      authError: null,
-      token: null,
-    });
-  }, []);
+    clearStoredAuth();
+    const tg = window.Telegram?.WebApp;
+    const hasLiveTelegramInitData = Boolean((tg?.initData && tg.initData.length > 0) || getInitDataFromHash());
+    setState(createSignedOutState({
+      needsBrowserLogin: !hasLiveTelegramInitData,
+    }));
+  }, [clearStoredAuth]);
+
+  useEffect(() => {
+    if (!state.token) {
+      return;
+    }
+
+    const onActivity = () => touchActivity();
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        touchActivity();
+      }
+    };
+
+    window.addEventListener('click', onActivity);
+    window.addEventListener('keydown', onActivity);
+    window.addEventListener('touchstart', onActivity);
+    window.addEventListener('mousemove', onActivity);
+    document.addEventListener('visibilitychange', onVisibility);
+
+    touchActivity(true);
+
+    return () => {
+      window.removeEventListener('click', onActivity);
+      window.removeEventListener('keydown', onActivity);
+      window.removeEventListener('touchstart', onActivity);
+      window.removeEventListener('mousemove', onActivity);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [state.token, touchActivity]);
 
   // Function to re-authenticate (e.g., on 401 error)
   const refreshAuth = useCallback(async () => {
     const tg = window.Telegram?.WebApp;
-    if (tg?.initData) {
+    if (tg?.initData && tg.initData.length > 0) {
       setState(prev => ({ ...prev, isAuthenticating: true }));
       try {
         await authenticate(tg.initData);
       } catch {
         clearAuth();
       }
+    } else if (!DEV_MODE) {
+      // Browser user — verify stored token is actually invalid before forcing re-login.
+      // This handles cases where the 401 interceptor fires due to transient server errors.
+      const storedToken = localStorage.getItem(JWT_STORAGE_KEY);
+      const storedUser = localStorage.getItem(USER_STORAGE_KEY);
+      if (storedToken && storedUser) {
+        try {
+          const apiBase = import.meta.env.VITE_API_BASE || '/api';
+          const validateRes = await fetch(`${apiBase}/me`, {
+            headers: { Authorization: `Bearer ${storedToken}` },
+            credentials: 'same-origin',
+          });
+          if (validateRes.ok) {
+            // Token is actually still valid — the 401 was transient, restore session silently
+            const user = JSON.parse(storedUser) as TelegramUser;
+            setState({
+              ...createSignedOutState({
+                user,
+                token: storedToken,
+              }),
+            });
+            touchActivity(true);
+            console.log('✅ Token still valid after 401 — session restored silently');
+            return;
+          }
+          // Token genuinely invalid — require re-login but DON'T clear storage yet
+          console.warn('⚠️ Token genuinely invalid after 401, requiring re-login');
+        } catch {
+          // Network error — still keep the session, don't force re-login
+          console.warn('⚠️ Could not validate token after 401 (network error), keeping session');
+          const user = JSON.parse(storedUser) as TelegramUser;
+          setState({
+            ...createSignedOutState({
+              user,
+              token: storedToken,
+            }),
+          });
+          touchActivity(true);
+          return;
+        }
+      }
+      // No stored token or genuinely invalid — require browser login
+      requireBrowserLogin('Session expired. Sign in with Telegram again.');
     } else {
       clearAuth();
     }
-  }, [authenticate, clearAuth]);
+  }, [authenticate, clearAuth, requireBrowserLogin, touchActivity]);
 
   return {
     initData: state.initData,
@@ -314,7 +834,9 @@ export function useTelegramAuth() {
     isAuthenticating: state.isAuthenticating,
     authError: state.authError,
     token: state.token,
+    needsBrowserLogin: state.needsBrowserLogin,
     clearAuth,
     refreshAuth,
+    startBrowserLogin,
   };
 }

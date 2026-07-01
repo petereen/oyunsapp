@@ -30,6 +30,22 @@ class AuthResponse(BaseModel):
     user: AuthenticatedUser
 
 
+class TelegramBrowserAuthChallengeResponse(BaseModel):
+    client_id: str
+    nonce: str
+    expires_in: int
+
+
+class TelegramBrowserAuthRequest(BaseModel):
+    id_token: str = Field(..., description="Telegram Login id_token")
+
+
+class TelegramBrowserCodeAuthRequest(BaseModel):
+    code: str = Field(..., description="Telegram OIDC authorization code")
+    code_verifier: str = Field(..., description="PKCE code_verifier used for Telegram OIDC")
+    redirect_uri: str = Field(..., description="Redirect URI used when opening Telegram OAuth")
+
+
 class RateResponse(BaseModel):
     buy_rate: Decimal
     sell_rate: Decimal
@@ -75,6 +91,7 @@ class ExchangeCreateRequest(BaseModel):
     receipt_path: Optional[str] = None
     receipt_paths: Optional[list[str]] = None  # Multiple receipt images
     invoice: Optional[str] = None
+    admin_bank_id: Optional[str] = None
 
 
 class ExchangeCreateResponse(BaseModel):
@@ -92,6 +109,7 @@ class ExchangeResubmitRequest(BaseModel):
     bank_details: str
     receipt_path: Optional[str] = None
     receipt_paths: Optional[list[str]] = None
+    admin_bank_id: Optional[str] = None
 
 
 class ExchangeEditableResponse(BaseModel):
@@ -105,6 +123,7 @@ class ExchangeEditableResponse(BaseModel):
     promo_discount: Decimal = Decimal("0")
     bank_details: str
     receipt_urls: list[str] = Field(default_factory=list)
+    admin_bank_id: Optional[str] = None
     can_edit: bool = False
 
 
@@ -199,6 +218,8 @@ class AdminInboxItem(BaseModel):
     saved_bank_info: Optional[str] = None  # User's saved bank info for comparison
     admin_label: Optional[str] = None  # Admin label for user (e.g. Тэмдэглэл, Сэжигтэй)
     admin_label_note: Optional[str] = None  # Admin note for the label
+    admin_bank_id: Optional[str] = None
+    admin_bank_name: Optional[str] = None
 
 
 class UserLabelUpdateRequest(BaseModel):
@@ -491,6 +512,8 @@ class AdminHistoryItem(BaseModel):
     rejection_comment: Optional[str] = None
     direction: Optional[str] = None
     completed_by_admin: Optional[int] = None
+    admin_bank_id: Optional[str] = None
+    admin_bank_name: Optional[str] = None
 
 
 class AdminHistoryResponse(BaseModel):

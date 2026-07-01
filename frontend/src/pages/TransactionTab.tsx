@@ -39,6 +39,14 @@ function parseSavedBank(saved: string | undefined): Record<string, string> {
   return result;
 }
 
+function buildSafeReceiptPath(direction: "buy" | "sell" | null, file: File) {
+  const folder = direction || "unknown";
+  const extRaw = (file.name.split(".").pop() || "jpg").toLowerCase();
+  const safeExt = extRaw.replace(/[^a-z0-9]/g, "") || "jpg";
+  const nonce = Math.random().toString(36).slice(2, 10);
+  return `${folder}/${Date.now()}-${nonce}.${safeExt}`;
+}
+
 export function TransactionTab({
   initData,
   user,
@@ -69,6 +77,9 @@ export function TransactionTab({
   const savedBankRub = userProfile?.bank_rub;
   const savedBankMnt = userProfile?.bank_mnt;
   const hasRubBank = savedBankRub && savedBankRub.trim() && savedBankRub !== ",,,";
+  const isSellLockedForReverification = userProfile?.verified === false
+    && Boolean(userProfile?.ready_for_verification)
+    && verificationLevel >= 2;
 
   // Flow states: "card" | "promo" | "adminBank" | "receipt" | "receivingBank" | "success"
   const [flowStep, setFlowStep] = useState<string>("card");
@@ -113,6 +124,7 @@ export function TransactionTab({
   const [successInvoice, setSuccessInvoice] = useState("");
   const [editLoading, setEditLoading] = useState(false);
   const [editInvoiceId, setEditInvoiceId] = useState<string | null>(initialEditInvoice || null);
+  const [editAdminBankId, setEditAdminBankId] = useState<string | null>(null);
 
   useEffect(() => {
     fetchAdminBankAccounts()
@@ -138,6 +150,9 @@ export function TransactionTab({
         effectiveRate: 0,
         rubEquivalent: 0,
         adjustment: 0,
+        volumeAdjustment: 0,
+        promoDiscount: 0,
+        promoSuppressedByVolume: false,
         adjustmentSource: "none" as const,
       };
     }
@@ -153,19 +168,24 @@ export function TransactionTab({
   const appliedAdjustment = pricing.adjustment;
   const adjustmentSource = pricing.adjustmentSource;
   const isVolumeDiscountApplied = adjustmentSource === "volume";
+  const promoSuppressedByVolume = pricing.promoSuppressedByVolume;
 
   const currencyFrom = direction === "buy" ? "RUB" : "MNT";
   const currencyTo = direction === "buy" ? "MNT" : "RUB";
+  const baseConvertedAmount = useMemo(() => {
+    if (!baseRate || !amount) return 0;
+    return direction === "buy" ? amount * baseRate : amount / baseRate;
+  }, [amount, baseRate, direction]);
   const convertedAmount = useMemo(() => {
     if (!effectiveRate || !amount) return 0;
     return direction === "buy" ? amount * effectiveRate : amount / effectiveRate;
   }, [amount, effectiveRate, direction]);
-
-  useEffect(() => {
-    if (flowStep === "promo" && isVolumeDiscountApplied) {
-      setFlowStep("adminBank");
+  const promoReceiveBonus = useMemo(() => {
+    if (direction !== "sell" || !promoValid || promoDiscount <= 0 || isVolumeDiscountApplied) {
+      return 0;
     }
-  }, [flowStep, isVolumeDiscountApplied]);
+    return Math.max(0, convertedAmount - baseConvertedAmount);
+  }, [baseConvertedAmount, convertedAmount, direction, isVolumeDiscountApplied, promoDiscount, promoValid]);
 
   const availableAdminBanks = useMemo(() => {
     if (direction === "buy") return adminBanks.filter((b) => b.currency === "RUB" && b.is_active);
@@ -211,6 +231,7 @@ export function TransactionTab({
         setPromoMessage("");
         setPromoError("");
         setUseSavedBank(false);
+        setEditAdminBankId(editable.admin_bank_id || null);
 
         const parts = (editable.bank_details || "").split(",").map((part) => part.trim());
         if (dir === "buy") {
@@ -268,6 +289,10 @@ export function TransactionTab({
   };
 
   const handleProceed = (dir: "buy" | "sell", amt: number, rt: number) => {
+    if (dir === "sell" && isSellLockedForReverification) {
+      setError(t("txn.sell_locked_reverification"));
+      return;
+    }
     if (dir === "sell" && !hasRubBank) {
       setShowRubBankWarning(true);
       return;
@@ -282,15 +307,8 @@ export function TransactionTab({
     setPromoMessage("");
     setPromoError("");
 
-    const nextPricing = getAppliedRateAdjustment({
-      direction: dir,
-      amount: amt,
-      baseRate: rt,
-      promoDiscount: 0,
-    });
-
     if (!invoiceId) setInvoiceId(generateInvoiceId());
-    setFlowStep(nextPricing.adjustmentSource === "volume" ? "adminBank" : "promo");
+    setFlowStep("promo");
     onResetDirection();
   };
 
@@ -304,9 +322,21 @@ export function TransactionTab({
     try {
       const res = await validatePromoCode(promoCode.trim(), direction);
       if (res.valid) {
-        setPromoDiscount(Number(res.discount_amount) || 0);
+        const nextPromoDiscount = Number(res.discount_amount) || 0;
+        const pricingWithPromo = getAppliedRateAdjustment({
+          direction,
+          amount,
+          baseRate,
+          promoDiscount: nextPromoDiscount,
+        });
+
+        setPromoDiscount(nextPromoDiscount);
         setPromoValid(true);
-        setPromoMessage(res.message || "");
+        if (pricingWithPromo.promoSuppressedByVolume) {
+          setPromoMessage(t("txn.promo_lower_than_volume_warning"));
+        } else {
+          setPromoMessage(res.message || "");
+        }
         setFlowStep("adminBank");
       } else {
         setPromoError(res.message || t("txn.promo_not_found"));
@@ -337,9 +367,13 @@ export function TransactionTab({
     try {
       setError("");
       setUploading(true);
-      const path = `${direction}/${Date.now()}-${file.name}`;
+      const path = buildSafeReceiptPath(direction, file);
       const presigned = await requestPresign({ bucket: "bills", path });
-      const res = await fetch(presigned.upload_url, { method: "PUT", body: file, headers: { "Content-Type": file.type } }); if (!res.ok) { const text = await res.text(); alert("UPLOAD FAIL: " + res.status + "\n" + text); throw new Error(text); }
+      const headers = file.type ? { "Content-Type": file.type } : undefined;
+      const res = await fetch(presigned.upload_url, { method: "PUT", body: file, headers });
+      if (!res.ok) {
+        throw new Error(`Upload failed with status ${res.status}`);
+      }
       setReceiptUrls((prev) => [...prev, presigned.public_url]);
     } catch {
       setError(t("txn.upload_error"));
@@ -385,7 +419,9 @@ export function TransactionTab({
         receipt_path: receiptUrls[0],
         receipt_paths: receiptUrls,
         promo_code: promoValid && !isVolumeDiscountApplied ? promoCode : undefined,
-        admin_bank_id: selectedAdminBank?.id != null ? Number(selectedAdminBank.id) : undefined,
+        admin_bank_id: direction === "buy"
+          ? (selectedAdminBank?.id != null ? String(selectedAdminBank.id) : undefined)
+          : (selectedMntAdminBank?.id != null ? String(selectedMntAdminBank.id) : undefined),
         invoice: invoiceId,
       };
       const res = await createExchange(payload);
@@ -415,6 +451,9 @@ export function TransactionTab({
         bank_details: buildBankDetails(),
         receipt_path: receiptUrls[0],
         receipt_paths: receiptUrls,
+        admin_bank_id: direction === "buy"
+          ? (selectedAdminBank?.id != null ? String(selectedAdminBank.id) : editAdminBankId || undefined)
+          : (selectedMntAdminBank?.id != null ? String(selectedMntAdminBank.id) : editAdminBankId || undefined),
       });
       setSuccessInvoice(response.invoice);
       setFlowStep("success");
@@ -457,6 +496,7 @@ export function TransactionTab({
     setMntIban("");
     setMntOwnerName("");
     setEditInvoiceId(null);
+    setEditAdminBankId(null);
   };
 
   // Registration modal state
@@ -743,9 +783,9 @@ export function TransactionTab({
         <RateInfo />
 
         {isVolumeDiscountApplied && (
-          <div className="flex items-center gap-2 p-3 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-xl text-green-700 dark:text-green-400 mb-3">
+          <div className="flex items-center gap-2 p-3 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-xl text-amber-700 dark:text-amber-400 mb-3">
             <Gift className="w-5 h-5" />
-            <span>{t("txn.volume_discount_skip_promo")}</span>
+            <span>{t("txn.volume_discount_active_compare")}</span>
           </div>
         )}
 
@@ -779,7 +819,13 @@ export function TransactionTab({
 
         {promoError && <div className="text-red-600 dark:text-red-400 text-sm mb-3">{promoError}</div>}
         {promoValid && promoDiscount > 0 && (
-          <div className="flex items-center gap-2 p-3 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-xl text-green-700 dark:text-green-400 mb-3">
+          <div
+            className={`flex items-center gap-2 p-3 rounded-xl mb-3 ${
+              promoSuppressedByVolume
+                ? "bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 text-amber-700 dark:text-amber-400"
+                : "bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 text-green-700 dark:text-green-400"
+            }`}
+          >
             <Gift className="w-5 h-5" />
             <span>{promoMessage || (direction === "buy" ? t("txn.promo_buy_applied", { amount: promoDiscount }) : t("txn.promo_sell_applied", { amount: promoDiscount }))}</span>
           </div>
@@ -803,7 +849,7 @@ export function TransactionTab({
   if (flowStep === "adminBank") {
     return (
       <div className="bg-white dark:bg-dark-800 p-5 rounded-3xl shadow-card border border-silver/60 dark:border-dark-600 animate-slideUp">
-        <FlowHeader title={t("txn.select_bank")} onBack={() => setFlowStep(isVolumeDiscountApplied ? "card" : "promo")} />
+        <FlowHeader title={t("txn.select_bank")} onBack={() => setFlowStep("promo")} />
         <RateInfo />
 
         <div className="text-sm text-dark-600 dark:text-ivory-300 mb-3">
@@ -963,6 +1009,18 @@ export function TransactionTab({
             <span>{t("txn.send_amount")}</span>
             <span className="font-bold">{amount.toLocaleString()} {currencyFrom}</span>
           </div>
+          {direction === "sell" && promoReceiveBonus > 0 && (
+            <>
+              <div className="flex justify-between text-dark-700 dark:text-ivory-300">
+                <span>{t("txn.receive_amount_before_promo")}</span>
+                <span>{baseConvertedAmount.toLocaleString(undefined, { maximumFractionDigits: 2 })} {currencyTo}</span>
+              </div>
+              <div className="flex justify-between text-green-700 dark:text-green-400">
+                <span>{t("txn.promo_bonus")}</span>
+                <span>+{promoReceiveBonus.toLocaleString(undefined, { maximumFractionDigits: 2 })} {currencyTo}</span>
+              </div>
+            </>
+          )}
           <div className="flex justify-between text-dark-800 dark:text-ivory-200">
             <span>{t("txn.receive_amount")}</span>
             <span className="font-bold">{convertedAmount.toLocaleString(undefined, { maximumFractionDigits: 2 })} {currencyTo}</span>

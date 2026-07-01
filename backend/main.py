@@ -10,7 +10,7 @@ import string
 import requests
 from decimal import Decimal, InvalidOperation
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -40,6 +40,9 @@ from models import (
     AppSettingsUpdateRequest,
     AuthRequest,
     AuthResponse,
+    TelegramBrowserAuthChallengeResponse,
+    TelegramBrowserAuthRequest,
+    TelegramBrowserCodeAuthRequest,
     BasicRegistrationRequest,
     EmailVerificationStartRequest,
     EmailVerificationCompleteRequest,
@@ -146,16 +149,23 @@ sys.path.insert(0, "/shared")
 from bot_translations import tb
 from utils import (
     TelegramAuthError,
+    TelegramLoginError,
     JWTAuthError,
     generate_invoice,
     verify_telegram_init_data,
+    create_telegram_login_challenge,
     create_jwt_token,
     verify_jwt_token,
+    verify_telegram_login_id_token,
+    verify_telegram_login_challenge,
+    exchange_telegram_login_code_for_id_token,
     log_admin_action,
     debug_telegram_validation,
 )
 
 logger = logging.getLogger("uvicorn.error")
+
+TELEGRAM_BROWSER_LOGIN_CHALLENGE_COOKIE = "oyuns_tg_browser_login_challenge_v1"
 
 
 VOLUME_DISCOUNT_TIERS: list[tuple[Decimal, Decimal]] = [
@@ -362,6 +372,54 @@ def _resolve_stored_promo(
             return _to_decimal(promo.get("discount")), promo.get("code"), promo.get("source")
 
     return Decimal("0"), (str(promo_code).strip() or None), None
+
+
+def _derive_waiting_edit_base_rate(
+    *,
+    direction: str,
+    stored_rate: Decimal,
+    promo_discount: Decimal = Decimal("0"),
+) -> Decimal:
+    effective_rate = _to_decimal(stored_rate)
+    if effective_rate <= 0:
+        return Decimal("0")
+
+    adjustment = _to_decimal(promo_discount)
+    if adjustment <= 0:
+        return effective_rate.quantize(Decimal("0.01"))
+
+    if direction.lower() == "buy":
+        base_rate = effective_rate - adjustment
+    else:
+        base_rate = effective_rate + adjustment
+
+    if base_rate <= 0:
+        return effective_rate.quantize(Decimal("0.01"))
+
+    return base_rate.quantize(Decimal("0.01"))
+
+
+def _is_sell_direction_locked_for_reverification(client, user_id: int) -> bool:
+    """Return True when a previously verified user is awaiting bank re-verification."""
+    try:
+        user_res = (
+            client.table("users")
+            .select("verified,ready_for_verification,verification_level")
+            .eq("id", user_id)
+            .limit(1)
+            .execute()
+        )
+        if not user_res.data:
+            return False
+
+        row = user_res.data[0]
+        verified = row.get("verified")
+        ready_for_verification = bool(row.get("ready_for_verification"))
+        verification_level = _safe_int(row.get("verification_level"), 0)
+        return verified is False and ready_for_verification and verification_level >= 2
+    except Exception as e:
+        logger.warning(f"Failed to determine sell-direction lock for user {user_id}: {e}")
+        return False
 
 
 def _get_user_lang(user_id: int) -> str:
@@ -691,6 +749,34 @@ async def require_admin_user(user=Depends(get_jwt_authenticated_user)):
     return user
 
 
+def _upsert_authenticated_user(user) -> None:
+    """Ensure the user exists in the database without overwriting registered names."""
+    try:
+        client = get_supabase()
+        existing = client.table("users").select("id,first_name").eq("id", user.id).limit(1).execute()
+        if existing.data:
+            client.table("users").update({
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("id", user.id).execute()
+        else:
+            client.table("users").insert({
+                "id": user.id,
+                "first_name": user.first_name,
+                "last_name": user.last_name,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }).execute()
+        logger.info(f"User {user.id} upserted in database")
+    except Exception as exc:
+        logger.warning(f"Failed to upsert user {user.id} in database: {exc}")
+
+
+def _issue_auth_response(user, settings) -> AuthResponse:
+    _upsert_authenticated_user(user)
+    token = create_jwt_token(user, settings.jwt_secret)
+    logger.info(f"User {user.id} authenticated successfully, JWT token issued")
+    return AuthResponse(token=token, user=user)
+
+
 @app.get("/api/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
     return HealthResponse()
@@ -735,43 +821,133 @@ async def authenticate(payload: AuthRequest):
         else:
             # Verify Telegram initData
             user = verify_telegram_init_data(payload.init_data, settings.bot_token)
-        
-        # Upsert user in database (create if new, update if exists)
-        # Only set first_name/last_name for NEW users, don't overwrite registered names
-        try:
-            client = get_supabase()
-            # Check if user already exists
-            existing = client.table("users").select("id,first_name").eq("id", user.id).limit(1).execute()
-            if existing.data:
-                # User exists - only update timestamp
-                client.table("users").update({
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                }).eq("id", user.id).execute()
-            else:
-                # New user - create with Telegram names
-                user_data = {
-                    "id": user.id,
-                    "first_name": user.first_name,
-                    "last_name": user.last_name,
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                }
-                client.table("users").insert(user_data).execute()
-            logger.info(f"User {user.id} upserted in database")
-        except Exception as e:
-            # Don't fail auth if DB upsert fails - user can still use the app
-            logger.warning(f"Failed to upsert user {user.id} in database: {e}")
-        
-        # Create JWT token
-        token = create_jwt_token(user, settings.jwt_secret)
-        
-        logger.info(f"User {user.id} authenticated successfully, JWT token issued")
-        
-        return AuthResponse(
-            token=token,
-            user=user,
-        )
+        return _issue_auth_response(user, settings)
     except TelegramAuthError as exc:
         logger.warning(f"Authentication failed for initData: {exc}")
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+
+
+@app.get("/api/auth/browser/challenge", response_model=TelegramBrowserAuthChallengeResponse)
+async def browser_auth_challenge(request: Request, response: Response):
+    settings = get_settings()
+    client_id = (settings.telegram_login_client_id or "").strip()
+
+    if not client_id:
+        raise HTTPException(status_code=503, detail="Telegram browser login is not configured")
+
+    nonce = secrets.token_urlsafe(32)
+    challenge = create_telegram_login_challenge(
+        nonce=nonce,
+        secret=settings.jwt_secret,
+        ttl_seconds=settings.telegram_login_nonce_ttl_seconds,
+    )
+
+    response.set_cookie(
+        key=TELEGRAM_BROWSER_LOGIN_CHALLENGE_COOKIE,
+        value=challenge,
+        max_age=settings.telegram_login_nonce_ttl_seconds,
+        httponly=True,
+        samesite="lax",
+        secure=not settings.dev_mode,
+        path="/",
+    )
+
+    logger.info("Issued Telegram browser login challenge for %s from %s", request.client.host if request.client else "unknown", request.url.path)
+
+    return TelegramBrowserAuthChallengeResponse(
+        client_id=client_id,
+        nonce=nonce,
+        expires_in=settings.telegram_login_nonce_ttl_seconds,
+    )
+
+
+@app.post("/api/auth/browser", response_model=AuthResponse)
+async def authenticate_browser(payload: TelegramBrowserAuthRequest, request: Request, response: Response):
+    settings = get_settings()
+    client_id = (settings.telegram_login_client_id or "").strip()
+
+    if not client_id:
+        raise HTTPException(status_code=503, detail="Telegram browser login is not configured")
+
+    challenge_cookie = request.cookies.get(TELEGRAM_BROWSER_LOGIN_CHALLENGE_COOKIE)
+    if not challenge_cookie:
+        raise HTTPException(status_code=401, detail="Missing Telegram login challenge")
+
+    try:
+        expected_nonce = verify_telegram_login_challenge(challenge_cookie, settings.jwt_secret)
+        user, received_nonce = verify_telegram_login_id_token(payload.id_token, client_id)
+
+        if not received_nonce or received_nonce != expected_nonce:
+            raise TelegramLoginError("Telegram login nonce mismatch")
+
+        auth_response = _issue_auth_response(user, settings)
+        response.delete_cookie(
+            key=TELEGRAM_BROWSER_LOGIN_CHALLENGE_COOKIE,
+            httponly=True,
+            samesite="lax",
+            secure=not settings.dev_mode,
+            path="/",
+        )
+        return auth_response
+    except TelegramLoginError as exc:
+        response.delete_cookie(
+            key=TELEGRAM_BROWSER_LOGIN_CHALLENGE_COOKIE,
+            httponly=True,
+            samesite="lax",
+            secure=not settings.dev_mode,
+            path="/",
+        )
+        logger.warning(f"Telegram browser authentication failed: {exc}")
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+
+
+@app.post("/api/auth/browser/code", response_model=AuthResponse)
+async def authenticate_browser_code(payload: TelegramBrowserCodeAuthRequest, request: Request, response: Response):
+    settings = get_settings()
+    client_id = (settings.telegram_login_client_id or "").strip()
+    client_secret = (settings.telegram_login_client_secret or "").strip()
+
+    if not client_id:
+        raise HTTPException(status_code=503, detail="Telegram browser login is not configured")
+    if not client_secret:
+        raise HTTPException(status_code=503, detail="Telegram browser login client secret is not configured")
+
+    challenge_cookie = request.cookies.get(TELEGRAM_BROWSER_LOGIN_CHALLENGE_COOKIE)
+    if not challenge_cookie:
+        raise HTTPException(status_code=401, detail="Missing Telegram login challenge")
+
+    try:
+        expected_nonce = verify_telegram_login_challenge(challenge_cookie, settings.jwt_secret)
+        id_token = exchange_telegram_login_code_for_id_token(
+            code=payload.code,
+            client_id=client_id,
+            client_secret=client_secret,
+            code_verifier=payload.code_verifier,
+            redirect_uri=payload.redirect_uri,
+        )
+        user, received_nonce = verify_telegram_login_id_token(id_token, client_id)
+
+        if not received_nonce or received_nonce != expected_nonce:
+            raise TelegramLoginError("Telegram login nonce mismatch")
+
+        auth_response = _issue_auth_response(user, settings)
+        response.delete_cookie(
+            key=TELEGRAM_BROWSER_LOGIN_CHALLENGE_COOKIE,
+            httponly=True,
+            samesite="lax",
+            secure=not settings.dev_mode,
+            path="/",
+        )
+        return auth_response
+    except TelegramLoginError as exc:
+        response.delete_cookie(
+            key=TELEGRAM_BROWSER_LOGIN_CHALLENGE_COOKIE,
+            httponly=True,
+            samesite="lax",
+            secure=not settings.dev_mode,
+            path="/",
+        )
+        logger.warning(f"Telegram browser code authentication failed: {exc}")
         raise HTTPException(status_code=401, detail=str(exc)) from exc
 
 
@@ -1726,6 +1902,12 @@ async def get_active_transactions(user=Depends(get_jwt_authenticated_user)):
     # Filter to only pending/approved or recently (within 24h) completed/successful/rejected
     from datetime import datetime, timedelta
     now = datetime.now()
+    # Fetch admin bank accounts for name resolution
+    admin_banks = {}
+    banks_res = client.table("admin_bank_accounts").select("id,bank_name").execute()
+    for b in banks_res.data or []:
+        admin_banks[str(b.get("id"))] = b.get("bank_name")
+        
     items = []
     for row in res.data or []:
         status = row.get("status")
@@ -2192,6 +2374,2077 @@ async def dashboard_transactions(
         "row_count": len(filtered_rows),
         "window_count": len(rows),
         "truncated": truncated,
+    }
+
+
+# ============================================================================
+# Dashboard Page 1: Balance accounting + Profit calculator (dashboard auth)
+# ============================================================================
+
+def _dashboard_timezone_key(value) -> str:
+    normalized = str(value or "moscow").strip().lower()
+    if normalized in {"ub", "ulaanbaatar", "asia/ulaanbaatar"}:
+        return "ub"
+    return "moscow"
+
+
+def _dashboard_zoneinfo(tz_key: str):
+    from zoneinfo import ZoneInfo
+
+    return ZoneInfo("Asia/Ulaanbaatar" if tz_key == "ub" else "Europe/Moscow")
+
+
+def _dashboard_day_bounds(date_str: str | None, tz_key: str = "moscow"):
+    """Return (start_iso, end_iso, date_iso) for the selected dashboard-local day."""
+    from datetime import timedelta
+
+    tz = _dashboard_zoneinfo(tz_key)
+    if date_str:
+        y, m, d = (int(x) for x in date_str.split("-"))
+        day_start = datetime(y, m, d, tzinfo=tz)
+    else:
+        now = datetime.now(tz)
+        day_start = datetime(now.year, now.month, now.day, tzinfo=tz)
+    day_end = day_start + timedelta(days=1)
+    return day_start.isoformat(), day_end.isoformat(), day_start.strftime("%Y-%m-%d")
+
+
+def _moscow_day_bounds(date_str: str | None):
+    """Return (start_iso, end_iso, date_iso) for a Moscow-local calendar day."""
+    return _dashboard_day_bounds(date_str, "moscow")
+
+
+def _dashboard_db_error(exc: Exception, action: str):
+    """Translate a Supabase/Postgres error into an actionable HTTP error.
+
+    The most common cause on a fresh install is that the Page-1 tables have
+    not been created yet, so surface a clear hint to run the migration instead
+    of a bare 500.
+    """
+    msg = str(exc)
+    logger.error(f"{action} failed: {msg}")
+    lowered = msg.lower()
+    if "does not exist" in lowered or "could not find the table" in lowered or "relation" in lowered:
+        return HTTPException(
+            status_code=500,
+            detail=(
+                "Database tables are missing. Run database/balance_profit_tables.sql "
+                "in the Supabase SQL editor to create treasury_accounts, cost_rates, "
+                "plane_ticket_sales, dashboard_balance_daily, and dashboard_balance_adjustments."
+            ),
+        )
+    return HTTPException(status_code=500, detail=f"{action}: {msg}")
+
+
+def _dashboard_today(tz_key: str = "moscow") -> str:
+    """Current calendar date in the selected dashboard timezone as YYYY-MM-DD."""
+    return datetime.now(_dashboard_zoneinfo(tz_key)).strftime("%Y-%m-%d")
+
+
+def _moscow_today() -> str:
+    """Current calendar date in Moscow time as YYYY-MM-DD."""
+    return _dashboard_today("moscow")
+
+
+def _dashboard_local_day_from_value(value, tz_key: str) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if len(raw) == 10 and raw[4] == "-" and raw[7] == "-":
+        return raw
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return raw[:10] if len(raw) >= 10 else None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(_dashboard_zoneinfo(tz_key)).strftime("%Y-%m-%d")
+
+
+def _optional_int(value, field_name: str) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"{field_name} must be an integer")
+
+
+def _optional_float(value, field_name: str) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"{field_name} must be a number")
+
+
+_TRANSACTIONS_ADMIN_BANK_ID_SUPPORTED: bool | None = None
+_TREASURY_ACCOUNTS_ADMIN_BANK_ID_SUPPORTED: bool | None = None
+
+
+def _normalize_balance_tag(value) -> str:
+    tag = str(value or "").strip()
+    if not tag:
+        raise HTTPException(status_code=400, detail="tag is required")
+    return tag[:80]
+
+def _is_missing_admin_bank_id_error(exc: Exception) -> bool:
+    lowered = str(exc).lower()
+    return (
+        "admin_bank_id" in lowered
+        and any(token in lowered for token in (
+            "schema cache",
+            "could not find the",
+            "column",
+            "does not exist",
+            "pgrst",
+        ))
+    )
+
+def _transactions_admin_bank_id_supported(client) -> bool:
+    global _TRANSACTIONS_ADMIN_BANK_ID_SUPPORTED
+    if _TRANSACTIONS_ADMIN_BANK_ID_SUPPORTED is not None:
+        return _TRANSACTIONS_ADMIN_BANK_ID_SUPPORTED
+    try:
+        client.table("transactions").select("admin_bank_id").limit(1).execute()
+        _TRANSACTIONS_ADMIN_BANK_ID_SUPPORTED = True
+    except Exception as exc:
+        if not _is_missing_admin_bank_id_error(exc):
+            raise
+        logger.warning(
+            "transactions.admin_bank_id is unavailable; falling back to legacy transaction flow: %s",
+            exc,
+        )
+        _TRANSACTIONS_ADMIN_BANK_ID_SUPPORTED = False
+    return _TRANSACTIONS_ADMIN_BANK_ID_SUPPORTED
+
+
+def _treasury_accounts_admin_bank_id_supported(client) -> bool:
+    global _TREASURY_ACCOUNTS_ADMIN_BANK_ID_SUPPORTED
+    if _TREASURY_ACCOUNTS_ADMIN_BANK_ID_SUPPORTED is not None:
+        return _TREASURY_ACCOUNTS_ADMIN_BANK_ID_SUPPORTED
+    try:
+        client.table("treasury_accounts").select("admin_bank_id").limit(1).execute()
+        _TREASURY_ACCOUNTS_ADMIN_BANK_ID_SUPPORTED = True
+    except Exception as exc:
+        if not _is_missing_admin_bank_id_error(exc):
+            raise
+        logger.warning(
+            "treasury_accounts.admin_bank_id is unavailable; falling back to admin-level treasury mapping: %s",
+            exc,
+        )
+        _TREASURY_ACCOUNTS_ADMIN_BANK_ID_SUPPORTED = False
+    return _TREASURY_ACCOUNTS_ADMIN_BANK_ID_SUPPORTED
+
+
+def _validated_admin_bank_account_id(client, value, field_name: str = "admin_bank_id") -> str | None:
+    if value in (None, ""):
+        return None
+    admin_bank_id = str(value).strip()
+    res = client.table("admin_bank_accounts").select("id").eq("id", admin_bank_id).limit(1).execute()
+    row = (res.data or [None])[0]
+    if not row:
+        raise HTTPException(status_code=400, detail=f"{field_name} must reference admin_bank_accounts.id")
+    return admin_bank_id
+
+
+def _dashboard_balance_setup_detail(exc: Exception) -> str | None:
+    lowered = str(exc).lower()
+    has_balance_table_ref = any(name in lowered for name in (
+        "dashboard_balance_daily",
+        "dashboard_balance_history",
+        "dashboard_balance_adjustments",
+        "treasury_accounts",
+    ))
+    has_permission_ref = any(token in lowered for token in (
+        "permission denied",
+        "row-level security",
+        "violates row-level security",
+        "forbidden",
+        "42501",
+    ))
+    has_schema_ref = any(token in lowered for token in (
+        "schema cache",
+        "could not find the table",
+        "does not exist",
+        "relation",
+    ))
+    if not (has_balance_table_ref or has_permission_ref or has_schema_ref):
+        return None
+    settings = get_settings()
+    key_hint = (
+        "The backend is currently using SUPABASE_KEY. If that env var contains the anon key, "
+        "these RLS-enabled dashboard tables will stay inaccessible. Set SUPABASE_SERVICE_ROLE_KEY "
+        "for the backend (preferred), or replace SUPABASE_KEY with the service-role key."
+        if settings.supabase_key_source == "SUPABASE_KEY"
+        else "The backend is already using SUPABASE_SERVICE_ROLE_KEY."
+    )
+    if has_permission_ref:
+        return (
+            "Dashboard balance tables exist but the backend cannot read them. "
+            f"{key_hint} Underlying error: {exc}"
+        )
+    return (
+        "Dashboard balance tables are not fully available to the backend. Run database/balance_profit_tables.sql "
+        "in Supabase, then restart the backend if the schema cache is stale. "
+        f"{key_hint} Underlying error: {exc}"
+    )
+
+
+def _dashboard_admins(client) -> list[dict]:
+    res = client.table("admin_users").select("id,name").eq("is_active", True).order("name").execute()
+    return [
+        {"admin_id": row.get("id"), "name": row.get("name")}
+        for row in (res.data or [])
+        if row.get("id") is not None
+    ]
+
+
+def _validated_dashboard_admin_id(client, value, field_name: str = "admin_id") -> int | None:
+    admin_id = _optional_int(value, field_name)
+    if admin_id is None:
+        return None
+    res = client.table("admin_users").select("id,is_active").eq("id", admin_id).limit(1).execute()
+    row = (res.data or [None])[0]
+    if not row:
+        raise HTTPException(status_code=400, detail=f"{field_name} must reference admin_users.id")
+    if row.get("is_active") is False:
+        raise HTTPException(status_code=400, detail=f"{field_name} must reference an active admin user")
+    return admin_id
+
+
+def _dashboard_scoped_admins(admins: list[dict], admin_id: int | None) -> list[dict]:
+    if admin_id is None:
+        return admins
+    return [admin for admin in admins if admin.get("admin_id") == admin_id]
+
+
+def _dashboard_calculated_balance(
+    opening_balance: float,
+    rub_to_mnt_rub: float,
+    mnt_to_rub_rub: float,
+    _adjustment_total: float,
+) -> float:
+    return opening_balance + rub_to_mnt_rub - mnt_to_rub_rub
+
+
+def _dashboard_balance_rows_for_day(client, admin_ids: list[int], day: str) -> dict[int, dict]:
+    if not admin_ids:
+        return {}
+    query = client.table("dashboard_balance_daily").select("*").eq("balance_date", day)
+    if len(admin_ids) == 1:
+        query = query.eq("admin_id", admin_ids[0])
+    else:
+        query = query.in_("admin_id", admin_ids)
+    rows = query.execute().data or []
+    return {
+        int(row.get("admin_id")): row
+        for row in rows
+        if row.get("admin_id") is not None
+    }
+
+
+def _dashboard_latest_prior_balance_rows(client, admin_ids: list[int], day: str) -> dict[int, dict]:
+    if not admin_ids:
+        return {}
+    query = client.table("dashboard_balance_daily").select("*").lt("balance_date", day).order("balance_date", desc=True)
+    if len(admin_ids) == 1:
+        query = query.eq("admin_id", admin_ids[0])
+    else:
+        query = query.in_("admin_id", admin_ids)
+    rows = query.execute().data or []
+    latest: dict[int, dict] = {}
+    for row in rows:
+        raw_admin_id = row.get("admin_id")
+        if raw_admin_id is None:
+            continue
+        admin_id = int(raw_admin_id)
+        if admin_id not in latest:
+            latest[admin_id] = row
+            if len(latest) == len(admin_ids):
+                break
+    return latest
+
+
+def _dashboard_daily_transaction_totals(client, day: str, admin_ids: list[int], tz_key: str = "moscow") -> dict:
+    if not admin_ids:
+        return {}
+    start_iso, end_iso, _ = _dashboard_day_bounds(day, tz_key)
+    admin_bank_supported = _transactions_admin_bank_id_supported(client)
+    rows: list[dict] = []
+    page = 1000
+    offset = 0
+    while offset < 20000:
+        select_fields = "amount,currency_from,rate,status,completed_by_admin,timestamp"
+        if admin_bank_supported:
+            select_fields += ",admin_bank_id"
+        query = (
+            client.table("transactions")
+            .select(select_fields)
+            .gte("timestamp", start_iso)
+            .lt("timestamp", end_iso)
+            .order("timestamp", desc=False)
+        )
+        if len(admin_ids) == 1:
+            query = query.eq("completed_by_admin", admin_ids[0])
+        else:
+            query = query.in_("completed_by_admin", admin_ids)
+        batch = query.range(offset, offset + page - 1).execute().data or []
+        rows.extend(batch)
+        if len(batch) < page:
+            break
+        offset += page
+
+    totals = {
+        admin_id: {"rub_to_mnt_rub": 0.0, "mnt_to_rub_rub": 0.0}
+        for admin_id in admin_ids
+    }
+    for row in rows:
+        if not _is_successful_status(row.get("status") or ""):
+            continue
+        raw_admin_id = row.get("completed_by_admin")
+        if raw_admin_id is None:
+            continue
+        admin_id = int(raw_admin_id)
+        if admin_id not in totals:
+            continue
+        admin_bank_id = str(row.get("admin_bank_id")) if row.get("admin_bank_id") else None
+        if admin_bank_id and admin_bank_id not in totals:
+            totals[admin_bank_id] = {"rub_to_mnt_rub": 0.0, "mnt_to_rub_rub": 0.0}
+
+        unassigned_key = f"unassigned_{admin_id}"
+        if not admin_bank_id and unassigned_key not in totals:
+            totals[unassigned_key] = {"rub_to_mnt_rub": 0.0, "mnt_to_rub_rub": 0.0}
+
+        amount = float(row.get("amount") or 0)
+        rate = float(row.get("rate") or 0)
+        currency_from = (row.get("currency_from") or "").upper()
+        rub_equivalent = _txn_rub_equivalent(amount, currency_from, rate)
+        if currency_from == "RUB":
+            totals[admin_id]["rub_to_mnt_rub"] += rub_equivalent
+            if admin_bank_id:
+                totals[admin_bank_id]["rub_to_mnt_rub"] += rub_equivalent
+            else:
+                totals[unassigned_key]["rub_to_mnt_rub"] += rub_equivalent
+        else:
+            totals[admin_id]["mnt_to_rub_rub"] += rub_equivalent
+            if admin_bank_id:
+                totals[admin_bank_id]["mnt_to_rub_rub"] += rub_equivalent
+            else:
+                totals[unassigned_key]["mnt_to_rub_rub"] += rub_equivalent
+    return totals
+
+
+def _dashboard_adjustments_for_day(client, day: str, admin_ids: list[int]) -> dict:
+    if not admin_ids:
+        return {"rows": [], "by_admin": {}, "totals": {}, "by_account": {}, "by_account_totals": {}}
+    query = client.table("dashboard_balance_adjustments").select("*").eq("balance_date", day).order("created_at")
+    if len(admin_ids) == 1:
+        query = query.eq("admin_id", admin_ids[0])
+    else:
+        query = query.in_("admin_id", admin_ids)
+    rows = query.execute().data or []
+    totals = {admin_id: 0.0 for admin_id in admin_ids}
+    by_admin = {admin_id: [] for admin_id in admin_ids}
+    by_account: dict[str, list[dict]] = {}
+    by_account_totals: dict[str, float] = {}
+    normalized_rows: list[dict] = []
+    for row in rows:
+        raw_admin_id = row.get("admin_id")
+        if raw_admin_id is None:
+            continue
+        admin_id = int(raw_admin_id)
+        amount = float(row.get("amount") or 0)
+        treasury_account_id = row.get("treasury_account_id")
+        normalized = {
+            **row,
+            "admin_id": admin_id,
+            "treasury_account_id": str(treasury_account_id) if treasury_account_id else None,
+            "amount": round(amount, 2),
+        }
+        normalized_rows.append(normalized)
+        totals[admin_id] = totals.get(admin_id, 0.0) + amount
+        by_admin.setdefault(admin_id, []).append(normalized)
+        if treasury_account_id:
+            account_id = str(treasury_account_id)
+            by_account.setdefault(account_id, []).append(normalized)
+            by_account_totals[account_id] = by_account_totals.get(account_id, 0.0) + amount
+    return {
+        "rows": normalized_rows,
+        "by_admin": by_admin,
+        "totals": totals,
+        "by_account": by_account,
+        "by_account_totals": by_account_totals,
+    }
+
+
+def _treasury_account_transaction_baseline(
+    client,
+    admin_id: int | None,
+    day: str,
+    tz_key: str = "moscow",
+    admin_bank_id: str | None = None,
+) -> dict[str, float]:
+    if admin_id is None:
+        return {"baseline_rub_to_mnt": 0.0, "baseline_mnt_to_rub": 0.0}
+    day_totals = _dashboard_daily_transaction_totals(client, day, [admin_id], tz_key=tz_key)
+    if admin_bank_id and _transactions_admin_bank_id_supported(client):
+        admin_totals = day_totals.get(admin_bank_id, {})
+    else:
+        admin_totals = day_totals.get(admin_id, {})
+    return {
+        "baseline_rub_to_mnt": round(float(admin_totals.get("rub_to_mnt_rub") or 0), 2),
+        "baseline_mnt_to_rub": round(float(admin_totals.get("mnt_to_rub_rub") or 0), 2),
+    }
+
+
+def _account_adjustment_totals(accounts: list[dict], adjustment_data: dict) -> dict[str, float]:
+    by_account_totals = {
+        str(account_id): float(total or 0)
+        for account_id, total in (adjustment_data.get("by_account_totals") or {}).items()
+    }
+    account_ids_by_admin: dict[int, list[str]] = {}
+    first_account_by_admin: dict[int, str] = {}
+    for account in accounts:
+        raw_admin_id = account.get("admin_id")
+        if raw_admin_id is None:
+            continue
+        admin_id = int(raw_admin_id)
+        account_id = str(account["id"])
+        first_account_by_admin.setdefault(admin_id, account_id)
+        account_ids_by_admin.setdefault(admin_id, []).append(account_id)
+
+    for admin_id, admin_total in (adjustment_data.get("totals") or {}).items():
+        normalized_admin_id = int(admin_id)
+        assigned_total = sum(
+            by_account_totals.get(account_id, 0.0)
+            for account_id in account_ids_by_admin.get(normalized_admin_id, [])
+        )
+        remainder = float(admin_total or 0) - assigned_total
+        if abs(remainder) < 0.0000001:
+            continue
+        fallback_account_id = first_account_by_admin.get(normalized_admin_id)
+        if fallback_account_id:
+            by_account_totals[fallback_account_id] = by_account_totals.get(fallback_account_id, 0.0) + remainder
+    return by_account_totals
+
+
+def _account_transaction_totals(accounts: list[dict], txn_totals_by_admin: dict) -> dict[str, dict[str, float]]:
+    """Map explicit bank transaction totals onto specific account rows, and
+    dump historical unassigned transactions onto the admin's first listed account.
+    """
+    assigned_admins: set[int] = set()
+    totals_by_account: dict[str, dict[str, float]] = {}
+    
+    for account in accounts:
+        account_id = str(account["id"])
+        raw_admin_id = account.get("admin_id")
+        mapped_admin_bank_id = str(account.get("admin_bank_id")) if account.get("admin_bank_id") else None
+        
+        # 1. Start with any explicitly assigned amounts
+        lookup_key = mapped_admin_bank_id or account_id
+        acct_txns = txn_totals_by_admin.get(lookup_key, {"rub_to_mnt_rub": 0.0, "mnt_to_rub_rub": 0.0})
+        rub_to_mnt = float(acct_txns.get("rub_to_mnt_rub") or 0)
+        mnt_to_rub = float(acct_txns.get("mnt_to_rub_rub") or 0)
+
+        # 2. Add unassigned amounts IF this is the admin's first account
+        if raw_admin_id is not None:
+            admin_id = int(raw_admin_id)
+            if admin_id not in assigned_admins:
+                assigned_admins.add(admin_id)
+                unassigned_key = f"unassigned_{admin_id}"
+                unassigned_txns = txn_totals_by_admin.get(unassigned_key, {"rub_to_mnt_rub": 0.0, "mnt_to_rub_rub": 0.0})
+                rub_to_mnt += float(unassigned_txns.get("rub_to_mnt_rub") or 0)
+                mnt_to_rub += float(unassigned_txns.get("mnt_to_rub_rub") or 0)
+
+        baseline_rub_to_mnt = float(account.get("baseline_rub_to_mnt") or 0)
+        baseline_mnt_to_rub = float(account.get("baseline_mnt_to_rub") or 0)
+        
+        totals_by_account[account_id] = {
+            "rub_to_mnt": max(rub_to_mnt - baseline_rub_to_mnt, 0.0),
+            "mnt_to_rub": max(mnt_to_rub - baseline_mnt_to_rub, 0.0),
+        }
+    return totals_by_account
+
+
+def _dashboard_previous_closing_balance(client, prior_row: dict, tz_key: str = "moscow") -> float:
+    entered_balance = prior_row.get("entered_balance")
+    if entered_balance is not None:
+        return float(entered_balance or 0)
+    raw_admin_id = prior_row.get("admin_id")
+    if raw_admin_id is None:
+        return float(prior_row.get("opening_balance") or 0)
+    admin_id = int(raw_admin_id)
+    day = str(prior_row.get("balance_date") or "")[:10]
+    txn_totals = _dashboard_daily_transaction_totals(client, day, [admin_id], tz_key=tz_key).get(admin_id, {})
+    return _dashboard_calculated_balance(
+        float(prior_row.get("opening_balance") or 0),
+        float(txn_totals.get("rub_to_mnt_rub") or 0),
+        float(txn_totals.get("mnt_to_rub_rub") or 0),
+        0.0,
+    )
+
+
+def _ensure_dashboard_balance_rows(client, admins: list[dict], day: str, tz_key: str = "moscow") -> dict[int, dict]:
+    admin_ids = [int(admin["admin_id"]) for admin in admins if admin.get("admin_id") is not None]
+    if not admin_ids:
+        return {}
+    rows_by_admin = _dashboard_balance_rows_for_day(client, admin_ids, day)
+    missing_admin_ids = [admin_id for admin_id in admin_ids if admin_id not in rows_by_admin]
+    if not missing_admin_ids:
+        return rows_by_admin
+
+    prior_rows = _dashboard_latest_prior_balance_rows(client, missing_admin_ids, day)
+    now = datetime.now(timezone.utc).isoformat()
+    inserts = []
+    for admin_id in missing_admin_ids:
+        opening_balance = 0.0
+        prior_row = prior_rows.get(admin_id)
+        if prior_row:
+            opening_balance = round(_dashboard_previous_closing_balance(client, prior_row, tz_key=tz_key), 2)
+        inserts.append({
+            "admin_id": admin_id,
+            "balance_date": day,
+            "opening_balance": opening_balance,
+            "entered_balance": None,
+            "created_at": now,
+            "updated_at": now,
+        })
+    if inserts:
+        client.table("dashboard_balance_daily").upsert(inserts, on_conflict="admin_id,balance_date").execute()
+    return _dashboard_balance_rows_for_day(client, admin_ids, day)
+
+
+def _dashboard_balance_payload(client, day: str, selected_admin_id: int | None, tz_key: str = "moscow") -> dict:
+    admins = _dashboard_admins(client)
+    scoped_admins = _dashboard_scoped_admins(admins, selected_admin_id)
+    rows_by_admin = _ensure_dashboard_balance_rows(client, scoped_admins, day, tz_key=tz_key)
+    admin_ids = [int(admin["admin_id"]) for admin in scoped_admins if admin.get("admin_id") is not None]
+    txn_totals = _dashboard_daily_transaction_totals(client, day, admin_ids, tz_key=tz_key)
+    adjustment_data = _dashboard_adjustments_for_day(client, day, admin_ids)
+    admin_names = {
+        int(admin["admin_id"]): admin.get("name")
+        for admin in admins
+        if admin.get("admin_id") is not None
+    }
+
+    daily_balances = []
+    prev_balance_total = 0.0
+    rub_to_mnt_total = 0.0
+    mnt_to_rub_total = 0.0
+    adjustment_total = 0.0
+    calculated_total = 0.0
+    entered_balance_total = 0.0
+    missing_entered_balance_count = 0
+
+    for admin in scoped_admins:
+        admin_id = int(admin["admin_id"])
+        row = rows_by_admin.get(admin_id) or {}
+        opening_balance = float(row.get("opening_balance") or 0)
+        entered_balance_raw = row.get("entered_balance")
+        entered_balance = float(entered_balance_raw or 0) if entered_balance_raw is not None else None
+        rub_to_mnt_rub = float(txn_totals.get(admin_id, {}).get("rub_to_mnt_rub") or 0)
+        mnt_to_rub_rub = float(txn_totals.get(admin_id, {}).get("mnt_to_rub_rub") or 0)
+        admin_adjustment_total = float(adjustment_data["totals"].get(admin_id) or 0)
+        calculated_balance = _dashboard_calculated_balance(
+            opening_balance,
+            rub_to_mnt_rub,
+            mnt_to_rub_rub,
+            admin_adjustment_total,
+        )
+        discrepancy = calculated_balance - entered_balance if entered_balance is not None else None
+
+        prev_balance_total += opening_balance
+        rub_to_mnt_total += rub_to_mnt_rub
+        mnt_to_rub_total += mnt_to_rub_rub
+        adjustment_total += admin_adjustment_total
+        calculated_total += calculated_balance
+        if entered_balance is not None:
+            entered_balance_total += entered_balance
+        else:
+            missing_entered_balance_count += 1
+
+        daily_balances.append({
+            "admin_id": admin_id,
+            "admin_name": admin_names.get(admin_id),
+            "balance_date": day,
+            "opening_balance": round(opening_balance, 2),
+            "entered_balance": round(entered_balance, 2) if entered_balance is not None else None,
+            "rub_to_mnt_rub": round(rub_to_mnt_rub, 2),
+            "mnt_to_rub_rub": round(mnt_to_rub_rub, 2),
+            "adjustment_total": round(admin_adjustment_total, 2),
+            "calculated_balance": round(calculated_balance, 2),
+            "discrepancy": round(discrepancy, 2) if discrepancy is not None else None,
+        })
+
+    adjustments = []
+    for row in adjustment_data["rows"]:
+        adjustments.append({
+            **row,
+            "admin_name": admin_names.get(int(row["admin_id"])),
+        })
+
+    selected_daily_balance = daily_balances[0] if selected_admin_id is not None and daily_balances else None
+    discrepancy_total = None
+    if missing_entered_balance_count == 0:
+        discrepancy_total = calculated_total - entered_balance_total
+
+    return {
+        "date": day,
+        "admins": admins,
+        "selected_admin_id": selected_admin_id,
+        "daily_balances": daily_balances,
+        "selected_daily_balance": selected_daily_balance,
+        "adjustments": adjustments,
+        "rub_to_mnt_rub": round(rub_to_mnt_total, 2),
+        "mnt_to_rub_rub": round(mnt_to_rub_total, 2),
+        "prev_balance_total": round(prev_balance_total, 2),
+        "adjustment_total": round(adjustment_total, 2),
+        "total_balance": round(calculated_total, 2),
+        "entered_balance_total": round(entered_balance_total, 2),
+        "difference_total": round(discrepancy_total, 2) if discrepancy_total is not None else None,
+        "missing_entered_balance_count": missing_entered_balance_count,
+    }
+
+
+def _dashboard_balance_history_row_key(day: str, admin_id: int | None) -> str:
+    return f"{day}:all" if admin_id is None else f"{day}:admin:{admin_id}"
+
+
+def _dashboard_balance_history_rows(payload: dict) -> list[dict]:
+    day = str(payload.get("date") or "")[:10]
+    now = datetime.now(timezone.utc).isoformat()
+    rows = [{
+        "row_key": _dashboard_balance_history_row_key(day, None),
+        "balance_date": day,
+        "scope_type": "all",
+        "admin_id": None,
+        "admin_name": "Бүх админ",
+        "opening_balance": round(float(payload.get("prev_balance_total") or 0), 2),
+        "rub_to_mnt_rub": round(float(payload.get("rub_to_mnt_rub") or 0), 2),
+        "mnt_to_rub_rub": round(float(payload.get("mnt_to_rub_rub") or 0), 2),
+        "adjustment_total": round(float(payload.get("adjustment_total") or 0), 2),
+        "calculated_balance": round(float(payload.get("total_balance") or 0), 2),
+        "entered_balance": round(float(payload.get("entered_balance_total") or 0), 2),
+        "discrepancy": round(float(payload.get("difference_total") or 0), 2) if payload.get("difference_total") is not None else None,
+        "created_at": now,
+        "updated_at": now,
+    }]
+
+    for row in payload.get("daily_balances") or []:
+        admin_id = int(row["admin_id"])
+        rows.append({
+            "row_key": _dashboard_balance_history_row_key(day, admin_id),
+            "balance_date": day,
+            "scope_type": "admin",
+            "admin_id": admin_id,
+            "admin_name": row.get("admin_name"),
+            "opening_balance": round(float(row.get("opening_balance") or 0), 2),
+            "rub_to_mnt_rub": round(float(row.get("rub_to_mnt_rub") or 0), 2),
+            "mnt_to_rub_rub": round(float(row.get("mnt_to_rub_rub") or 0), 2),
+            "adjustment_total": round(float(row.get("adjustment_total") or 0), 2),
+            "calculated_balance": round(float(row.get("calculated_balance") or 0), 2),
+            "entered_balance": round(float(row.get("entered_balance") or 0), 2) if row.get("entered_balance") is not None else None,
+            "discrepancy": round(float(row.get("discrepancy") or 0), 2) if row.get("discrepancy") is not None else None,
+            "created_at": now,
+            "updated_at": now,
+        })
+    return rows
+
+
+def _dashboard_balance_history_candidate_days(client, today: str) -> list[str]:
+    days: set[str] = set()
+    for table_name in ("dashboard_balance_daily", "dashboard_balance_adjustments"):
+        rows = (
+            client.table(table_name)
+            .select("balance_date")
+            .lt("balance_date", today)
+            .order("balance_date", desc=False)
+            .execute()
+            .data
+            or []
+        )
+        for row in rows:
+            raw_day = str(row.get("balance_date") or "")[:10]
+            if raw_day:
+                days.add(raw_day)
+
+    yesterday = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=1)).date().isoformat()
+    if yesterday:
+        days.add(yesterday)
+    return sorted(day for day in days if day < today)
+
+
+def _ensure_dashboard_balance_history_snapshots(client) -> None:
+    _rollover_treasury_accounts(client)
+    today = _moscow_today()
+    for day in _dashboard_balance_history_candidate_days(client, today):
+        history_key = _dashboard_balance_history_row_key(day, None)
+        exists = (
+            client.table("dashboard_balance_history")
+            .select("row_key")
+            .eq("row_key", history_key)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if exists:
+            continue
+        payload = _dashboard_balance_payload(client, day, None)
+        rows = _dashboard_balance_history_rows(payload)
+        if rows:
+            client.table("dashboard_balance_history").upsert(rows, on_conflict="row_key").execute()
+
+
+def _list_dashboard_balance_history(client, max_days: int) -> dict:
+    _ensure_dashboard_balance_history_snapshots(client)
+    rows = (
+        client.table("dashboard_balance_history")
+        .select("*")
+        .order("balance_date", desc=True)
+        .limit(max(max_days * 12, 120))
+        .execute()
+        .data
+        or []
+    )
+
+    normalized_rows: list[dict] = []
+    included_days: list[str] = []
+    seen_days: set[str] = set()
+    for row in rows:
+        day = str(row.get("balance_date") or "")[:10]
+        if not day:
+            continue
+        if day not in seen_days:
+            if len(seen_days) >= max_days:
+                continue
+            seen_days.add(day)
+            included_days.append(day)
+        normalized_rows.append({
+            **row,
+            "balance_date": day,
+            "admin_id": int(row["admin_id"]) if row.get("admin_id") is not None else None,
+            "opening_balance": round(float(row.get("opening_balance") or 0), 2),
+            "rub_to_mnt_rub": round(float(row.get("rub_to_mnt_rub") or 0), 2),
+            "mnt_to_rub_rub": round(float(row.get("mnt_to_rub_rub") or 0), 2),
+            "adjustment_total": round(float(row.get("adjustment_total") or 0), 2),
+            "calculated_balance": round(float(row.get("calculated_balance") or 0), 2),
+            "entered_balance": round(float(row.get("entered_balance") or 0), 2) if row.get("entered_balance") is not None else None,
+            "discrepancy": round(float(row.get("discrepancy") or 0), 2) if row.get("discrepancy") is not None else None,
+        })
+
+    normalized_rows.sort(key=lambda row: (
+        row["balance_date"],
+        1 if row.get("scope_type") == "all" else 0,
+        (row.get("admin_name") or "").lower(),
+    ), reverse=True)
+    return {"days": included_days, "rows": normalized_rows}
+
+
+def _dashboard_balance_fallback_payload(client, day: str, selected_admin_id: int | None, setup_error: str) -> dict:
+    admins = _dashboard_admins(client)
+    scoped_admins = _dashboard_scoped_admins(admins, selected_admin_id)
+    admin_ids = [int(admin["admin_id"]) for admin in scoped_admins if admin.get("admin_id") is not None]
+    txn_totals = _dashboard_daily_transaction_totals(client, day, admin_ids)
+
+    daily_balances = []
+    rub_to_mnt_total = 0.0
+    mnt_to_rub_total = 0.0
+    total_balance = 0.0
+    for admin in scoped_admins:
+        admin_id = int(admin["admin_id"])
+        rub_to_mnt_rub = float(txn_totals.get(admin_id, {}).get("rub_to_mnt_rub") or 0)
+        mnt_to_rub_rub = float(txn_totals.get(admin_id, {}).get("mnt_to_rub_rub") or 0)
+        calculated_balance = _dashboard_calculated_balance(0.0, rub_to_mnt_rub, mnt_to_rub_rub, 0.0)
+        rub_to_mnt_total += rub_to_mnt_rub
+        mnt_to_rub_total += mnt_to_rub_rub
+        total_balance += calculated_balance
+        daily_balances.append({
+            "admin_id": admin_id,
+            "admin_name": admin.get("name"),
+            "balance_date": day,
+            "opening_balance": 0.0,
+            "entered_balance": None,
+            "rub_to_mnt_rub": round(rub_to_mnt_rub, 2),
+            "mnt_to_rub_rub": round(mnt_to_rub_rub, 2),
+            "adjustment_total": 0.0,
+            "calculated_balance": round(calculated_balance, 2),
+            "discrepancy": None,
+        })
+
+    selected_daily_balance = daily_balances[0] if selected_admin_id is not None and daily_balances else None
+    return {
+        "date": day,
+        "admins": admins,
+        "selected_admin_id": selected_admin_id,
+        "daily_balances": daily_balances,
+        "selected_daily_balance": selected_daily_balance,
+        "adjustments": [],
+        "rub_to_mnt_rub": round(rub_to_mnt_total, 2),
+        "mnt_to_rub_rub": round(mnt_to_rub_total, 2),
+        "prev_balance_total": 0.0,
+        "adjustment_total": 0.0,
+        "total_balance": round(total_balance, 2),
+        "entered_balance_total": 0.0,
+        "difference_total": None,
+        "missing_entered_balance_count": len(scoped_admins),
+        "setup_required": True,
+        "setup_error": setup_error,
+    }
+
+
+def _account_legacy_adjustment(a: dict) -> float:
+    return float(a.get("adjustment") or 0)
+
+
+def _account_balance(a: dict, adjustment_total: float | None = None, txn_totals: dict[str, float] | None = None) -> float:
+    """Balance for the day = prev + RUB→MNT − MNT→RUB (all in RUB)."""
+    if txn_totals is None:
+        rub_to_mnt = float(a.get("rub_to_mnt") or 0)
+        mnt_to_rub = float(a.get("mnt_to_rub") or 0)
+    else:
+        rub_to_mnt = float(txn_totals.get("rub_to_mnt") or 0)
+        mnt_to_rub = float(txn_totals.get("mnt_to_rub") or 0)
+    return (
+        float(a.get("prev_balance") or 0)
+        + rub_to_mnt
+        - mnt_to_rub
+    )
+
+
+def _account_entered_balance(a: dict) -> float | None:
+    raw = a.get("entered_balance")
+    if raw is None:
+        return None
+    return float(raw or 0)
+
+
+def _account_discrepancy(a: dict) -> float | None:
+    entered_balance = _account_entered_balance(a)
+    if entered_balance is None:
+        return None
+    return _account_balance(a) - entered_balance
+
+
+def _dashboard_daily_rows_from_accounts(
+    accounts: list[dict],
+    admins: list[dict],
+    day: str,
+    selected_admin_id: int | None,
+) -> dict:
+    scoped_admins = _dashboard_scoped_admins(admins, selected_admin_id)
+    summaries: dict[int, dict] = {}
+    for admin in scoped_admins:
+        raw_admin_id = admin.get("admin_id")
+        if raw_admin_id is None:
+            continue
+        admin_id = int(raw_admin_id)
+        summaries[admin_id] = {
+            "admin_id": admin_id,
+            "admin_name": admin.get("name"),
+            "balance_date": day,
+            "opening_balance": 0.0,
+            "entered_balance": 0.0,
+            "rub_to_mnt_rub": 0.0,
+            "mnt_to_rub_rub": 0.0,
+            "adjustment_total": 0.0,
+            "calculated_balance": 0.0,
+            "account_count": 0,
+            "missing_entered_balance_count": 0,
+        }
+
+    for account in accounts:
+        raw_admin_id = account.get("admin_id")
+        if raw_admin_id is None:
+            continue
+        admin_id = int(raw_admin_id)
+        summary = summaries.get(admin_id)
+        if not summary:
+            continue
+        summary["account_count"] += 1
+        summary["opening_balance"] += float(account.get("prev_balance") or 0)
+        summary["rub_to_mnt_rub"] += float(account.get("rub_to_mnt") or 0)
+        summary["mnt_to_rub_rub"] += float(account.get("mnt_to_rub") or 0)
+        summary["adjustment_total"] += float(account.get("adjustment_total") or 0)
+        summary["calculated_balance"] += float(account.get("calculated_balance") or 0)
+
+        entered_balance = account.get("entered_balance")
+        if entered_balance is None:
+            summary["missing_entered_balance_count"] += 1
+        else:
+            summary["entered_balance"] += float(entered_balance or 0)
+
+    daily_balances: list[dict] = []
+    prev_balance_total = 0.0
+    rub_to_mnt_total = 0.0
+    mnt_to_rub_total = 0.0
+    adjustment_total = 0.0
+    calculated_total = 0.0
+    entered_balance_total = 0.0
+    missing_entered_balance_count = 0
+
+    for admin in scoped_admins:
+        raw_admin_id = admin.get("admin_id")
+        if raw_admin_id is None:
+            continue
+        admin_id = int(raw_admin_id)
+        summary = summaries[admin_id]
+        if selected_admin_id is None and summary["account_count"] == 0:
+            continue
+
+        entered_balance_value = round(summary["entered_balance"], 2)
+        discrepancy = None
+        if summary["account_count"] > 0 and summary["missing_entered_balance_count"] == 0:
+            discrepancy = round(summary["calculated_balance"] - summary["entered_balance"], 2)
+
+        prev_balance_total += summary["opening_balance"]
+        rub_to_mnt_total += summary["rub_to_mnt_rub"]
+        mnt_to_rub_total += summary["mnt_to_rub_rub"]
+        adjustment_total += summary["adjustment_total"]
+        calculated_total += summary["calculated_balance"]
+        entered_balance_total += summary["entered_balance"]
+        missing_entered_balance_count += summary["missing_entered_balance_count"]
+
+        daily_balances.append({
+            "admin_id": admin_id,
+            "admin_name": summary["admin_name"],
+            "balance_date": day,
+            "opening_balance": round(summary["opening_balance"], 2),
+            "entered_balance": entered_balance_value,
+            "rub_to_mnt_rub": round(summary["rub_to_mnt_rub"], 2),
+            "mnt_to_rub_rub": round(summary["mnt_to_rub_rub"], 2),
+            "adjustment_total": round(summary["adjustment_total"], 2),
+            "calculated_balance": round(summary["calculated_balance"], 2),
+            "discrepancy": discrepancy,
+        })
+
+    difference_total = None
+    if daily_balances and missing_entered_balance_count == 0:
+        difference_total = round(calculated_total - entered_balance_total, 2)
+
+    selected_daily_balance = daily_balances[0] if selected_admin_id is not None and daily_balances else None
+    return {
+        "daily_balances": daily_balances,
+        "selected_daily_balance": selected_daily_balance,
+        "prev_balance_total": round(prev_balance_total, 2),
+        "rub_to_mnt_rub": round(rub_to_mnt_total, 2),
+        "mnt_to_rub_rub": round(mnt_to_rub_total, 2),
+        "adjustment_total": round(adjustment_total, 2),
+        "total_balance": round(calculated_total, 2),
+        "entered_balance_total": round(entered_balance_total, 2),
+        "difference_total": difference_total,
+        "missing_entered_balance_count": missing_entered_balance_count,
+    }
+
+
+def _dashboard_treasury_balance_payload(client, selected_admin_id: int | None, tz_key: str = "moscow") -> dict:
+    admins = _dashboard_admins(client)
+    accounts = _rollover_treasury_accounts(client, admin_id=selected_admin_id, tz_key=tz_key)
+    today = _dashboard_today(tz_key)
+    treasury_bank_supported = _treasury_accounts_admin_bank_id_supported(client)
+    admin_ids = sorted({int(account["admin_id"]) for account in accounts if account.get("admin_id") is not None})
+    txn_totals = _dashboard_daily_transaction_totals(client, today, admin_ids, tz_key=tz_key)
+    account_txn_totals = _account_transaction_totals(accounts, txn_totals)
+    adjustment_data = _dashboard_adjustments_for_day(client, today, admin_ids)
+    account_adjustment_totals = _account_adjustment_totals(accounts, adjustment_data)
+    admin_names = {
+        int(admin["admin_id"]): admin.get("name")
+        for admin in admins
+        if admin.get("admin_id") is not None
+    }
+    admin_banks_by_id: dict[str, dict] = {}
+    if treasury_bank_supported:
+        banks_res = client.table("admin_bank_accounts").select("id,bank_name,owner_name,currency,admin_id").execute()
+        admin_banks_by_id = {
+            str(bank.get("id")): bank
+            for bank in (banks_res.data or [])
+            if bank.get("id") is not None
+        }
+    account_names = {str(account["id"]): account.get("name") for account in accounts}
+
+    enriched_accounts: list[dict] = []
+    prev_sum = 0.0
+    rub_to_mnt_sum = 0.0
+    mnt_to_rub_sum = 0.0
+    adjustment_sum = 0.0
+    calculated_total = 0.0
+    entered_balance_total = 0.0
+    missing_entered_balance_count = 0
+
+    for account in accounts:
+        account_txns = account_txn_totals.get(str(account["id"]), {"rub_to_mnt": 0.0, "mnt_to_rub": 0.0})
+        account_adjustment_total = _account_legacy_adjustment(account) + float(account_adjustment_totals.get(str(account["id"])) or 0)
+        rub_to_mnt = float(account_txns.get("rub_to_mnt") or 0)
+        mnt_to_rub = float(account_txns.get("mnt_to_rub") or 0)
+        calculated_balance = round(_account_balance(account, account_adjustment_total, account_txns), 2)
+        entered_balance = _account_entered_balance(account)
+        discrepancy = calculated_balance - entered_balance if entered_balance is not None else None
+
+        prev_sum += float(account.get("prev_balance") or 0)
+        rub_to_mnt_sum += rub_to_mnt
+        mnt_to_rub_sum += mnt_to_rub
+        adjustment_sum += account_adjustment_total
+        calculated_total += calculated_balance
+        if entered_balance is None:
+            missing_entered_balance_count += 1
+        else:
+            entered_balance_total += entered_balance
+
+        admin_id = _optional_int(account.get("admin_id"), "admin_id")
+        admin_bank_id = str(account.get("admin_bank_id")) if account.get("admin_bank_id") else None
+        bank_meta = admin_banks_by_id.get(admin_bank_id) if admin_bank_id else None
+        enriched_accounts.append({
+            **account,
+            "admin_id": admin_id,
+            "admin_name": admin_names.get(admin_id) if admin_id is not None else None,
+            "admin_bank_id": admin_bank_id,
+            "admin_bank_name": bank_meta.get("bank_name") if bank_meta else None,
+            "admin_bank_owner": bank_meta.get("owner_name") if bank_meta else None,
+            "admin_bank_currency": bank_meta.get("currency") if bank_meta else None,
+            "rub_to_mnt": round(rub_to_mnt, 2),
+            "mnt_to_rub": round(mnt_to_rub, 2),
+            "entered_balance": round(entered_balance, 2) if entered_balance is not None else None,
+            "adjustment_total": round(account_adjustment_total, 2),
+            "calculated_balance": calculated_balance,
+            "discrepancy": round(discrepancy, 2) if discrepancy is not None else None,
+        })
+
+    adjustments = []
+    for row in adjustment_data["rows"]:
+        account_id = row.get("treasury_account_id")
+        adjustments.append({
+            **row,
+            "admin_name": admin_names.get(int(row["admin_id"])),
+            "account_name": account_names.get(str(account_id)) if account_id else None,
+        })
+
+    account_summary = _dashboard_daily_rows_from_accounts(enriched_accounts, admins, today, selected_admin_id)
+
+    return {
+        "date": today,
+        "admins": admins,
+        "selected_admin_id": selected_admin_id,
+        "accounts": enriched_accounts,
+        "daily_balances": account_summary["daily_balances"],
+        "selected_daily_balance": account_summary["selected_daily_balance"],
+        "adjustments": adjustments,
+        "rub_to_mnt_rub": account_summary["rub_to_mnt_rub"],
+        "mnt_to_rub_rub": account_summary["mnt_to_rub_rub"],
+        "prev_balance_total": account_summary["prev_balance_total"],
+        "adjustment_total": account_summary["adjustment_total"],
+        "total_balance": account_summary["total_balance"],
+        "entered_balance_total": account_summary["entered_balance_total"],
+        "difference_total": account_summary["difference_total"],
+        "missing_entered_balance_count": account_summary["missing_entered_balance_count"],
+        "setup_required": False,
+        "setup_error": None,
+    }
+
+
+def _rollover_treasury_accounts(client, admin_id: int | None = None, tz_key: str = "moscow") -> list[dict]:
+    """Carry each account's computed balance into prev_balance when its day ends.
+
+    Lazy rollover: when an account's stored balance_date is before the current
+    Moscow day, today's computed balance becomes the new previous-day balance
+    and the daily fields (rub_to_mnt, mnt_to_rub, adjustment) reset to 0. Daily
+    RUB→MNT / MNT→RUB figures come from completed transactions for the assigned
+    admin; separate other income/expense rows stay informational only. This is
+    triggered on read, so no always-on scheduler is required. Returns the
+    up-to-date account rows ordered by display_order.
+    """
+    today = _dashboard_today(tz_key)
+    query = client.table("treasury_accounts").select("*")
+    if admin_id is not None:
+        query = query.eq("admin_id", admin_id)
+    accounts = query.order("display_order").execute().data or []
+    stale_accounts_by_day: dict[str, list[dict]] = {}
+    for account in accounts:
+        balance_day = str(account.get("balance_date") or "")[:10]
+        if balance_day and balance_day < today:
+            stale_accounts_by_day.setdefault(balance_day, []).append(account)
+
+    txn_totals_by_day: dict[str, dict[str, dict[str, float]]] = {}
+    for balance_day, day_accounts in stale_accounts_by_day.items():
+        admin_ids = sorted({int(account["admin_id"]) for account in day_accounts if account.get("admin_id") is not None})
+        day_txn_totals = _dashboard_daily_transaction_totals(client, balance_day, admin_ids, tz_key=tz_key)
+        txn_totals_by_day[balance_day] = _account_transaction_totals(day_accounts, day_txn_totals)
+
+        admin_entered: dict[int, float] = {}
+        admin_missing: dict[int, bool] = {}
+        admin_opening: dict[int, float] = {}
+        for account in day_accounts:
+            a_id = account.get("admin_id")
+            if a_id is None:
+                continue
+            a_id = int(a_id)
+            admin_opening[a_id] = admin_opening.get(a_id, 0.0) + float(account.get("prev_balance") or 0)
+            eb = _account_entered_balance(account)
+            if eb is None:
+                admin_missing[a_id] = True
+            else:
+                admin_entered[a_id] = admin_entered.get(a_id, 0.0) + eb
+                
+        for a_id in admin_ids:
+            if not admin_missing.get(a_id, False) and a_id in admin_entered:
+                try:
+                    client.table("dashboard_balance_daily").upsert({
+                        "admin_id": a_id,
+                        "balance_date": balance_day,
+                        "opening_balance": round(admin_opening.get(a_id, 0.0), 2),
+                        "entered_balance": round(admin_entered[a_id], 2),
+                        "updated_at": datetime.now(timezone.utc).isoformat()
+                    }, on_conflict="admin_id,balance_date").execute()
+                except Exception as sync_exc:
+                    logger.warning(f"Failed to sync daily entered balance on rollover: {sync_exc}")
+
+    refreshed: list[dict] = []
+    for a in accounts:
+        bdate = (a.get("balance_date") or "")[:10]
+        if bdate and bdate < today:
+            account_txns = txn_totals_by_day.get(bdate, {}).get(str(a["id"]), {"rub_to_mnt": 0.0, "mnt_to_rub": 0.0})
+            entered_balance = _account_entered_balance(a)
+            new_prev = entered_balance if entered_balance is not None else _account_balance(a, txn_totals=account_txns)
+            upd = {
+                "prev_balance": round(new_prev, 2),
+                "rub_to_mnt": 0,
+                "mnt_to_rub": 0,
+                "baseline_rub_to_mnt": 0,
+                "baseline_mnt_to_rub": 0,
+                "adjustment": 0,
+                "entered_balance": None,
+                "balance_date": today,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            client.table("treasury_accounts").update(upd).eq("id", a["id"]).execute()
+            a = {**a, **upd}
+        elif not bdate:
+            # First time we see this account: stamp it with today's Moscow date.
+            client.table("treasury_accounts").update({"balance_date": today}).eq("id", a["id"]).execute()
+            a = {**a, "balance_date": today}
+        refreshed.append(a)
+    return refreshed
+
+
+def _cost_rate_for_day(client, day: str) -> float | None:
+    res = (
+        client.table("cost_rates")
+        .select("rate_date,cost_rate")
+        .lte("rate_date", day)
+        .order("rate_date", desc=True)
+        .limit(1)
+        .execute()
+    )
+    row = (res.data or [None])[0]
+    if not row or row.get("cost_rate") is None:
+        return None
+    return float(row.get("cost_rate") or 0)
+
+
+def _dashboard_day_series(start_day: str, end_day: str, max_days: int = 370) -> list[str]:
+    """Inclusive YYYY-MM-DD day series with a safety cap."""
+    try:
+        start_dt = datetime.strptime(start_day, "%Y-%m-%d").date()
+        end_dt = datetime.strptime(end_day, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="start/end must be valid YYYY-MM-DD dates")
+    if end_dt < start_dt:
+        raise HTTPException(status_code=400, detail="end must be on or after start")
+    days = (end_dt - start_dt).days + 1
+    if days > max_days:
+        raise HTTPException(status_code=400, detail=f"date range is too large (max {max_days} days)")
+    return [(start_dt + timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(days)]
+
+
+def _bulk_upsert_cost_rates(client, rows: list[dict]) -> None:
+    if not rows:
+        return
+    for offset in range(0, len(rows), 400):
+        client.table("cost_rates").upsert(rows[offset:offset + 400], on_conflict="rate_date").execute()
+
+
+def _sync_black_rates_into_cost_rates(client, rates: dict[str, float | None]) -> int:
+    """Persist fetched daily black rates into cost_rates while preserving usd_rate."""
+    normalized = {
+        str(day)[:10]: float(value)
+        for day, value in (rates or {}).items()
+        if value is not None
+    }
+    if not normalized:
+        return 0
+
+    dates = sorted(normalized.keys())
+    existing_usd: dict[str, float | None] = {}
+    for offset in range(0, len(dates), 200):
+        chunk = dates[offset:offset + 200]
+        res = client.table("cost_rates").select("rate_date,usd_rate").in_("rate_date", chunk).execute()
+        for row in res.data or []:
+            day = str(row.get("rate_date") or "")[:10]
+            usd = row.get("usd_rate")
+            existing_usd[day] = float(usd) if usd is not None else None
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    upserts: list[dict] = []
+    for day in dates:
+        black_rate = normalized.get(day)
+        usd_rate = existing_usd.get(day)
+        cost_rate = (usd_rate / black_rate) if (usd_rate is not None and black_rate not in (None, 0)) else None
+        upserts.append({
+            "rate_date": day,
+            "usd_rate": usd_rate,
+            "black_rate": black_rate,
+            "cost_rate": cost_rate,
+            "updated_at": now_iso,
+        })
+
+    _bulk_upsert_cost_rates(client, upserts)
+    return len(upserts)
+
+
+def _plane_ticket_sale_row(client, payload: dict) -> dict:
+    sale_date = str(payload.get("sale_date") or payload.get("date") or _moscow_today())[:10]
+    try:
+        sold_price_mnt = float(payload.get("sold_price_mnt") or payload.get("sold_price") or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="sold_price_mnt must be a number")
+    if sold_price_mnt <= 0:
+        raise HTTPException(status_code=400, detail="sold_price_mnt must be greater than 0")
+
+    raw_exchange_rate = payload.get("exchange_rate")
+    if raw_exchange_rate in (None, ""):
+        raw_exchange_rate = payload.get("rate")
+
+    if raw_exchange_rate in (None, ""):
+        raise HTTPException(status_code=400, detail="exchange_rate is required")
+
+    try:
+        exchange_rate = float(raw_exchange_rate)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="exchange_rate must be a number")
+    if exchange_rate <= 0:
+        raise HTTPException(status_code=400, detail="exchange_rate must be greater than 0")
+
+    cost_rate = _cost_rate_for_day(client, sale_date)
+    if cost_rate is None or cost_rate <= 0:
+        raise HTTPException(status_code=400, detail=f"No cost rate is available on or before {sale_date}")
+
+    rub_equivalent = sold_price_mnt / exchange_rate if exchange_rate else 0.0
+    profit_mnt = (exchange_rate - cost_rate) * rub_equivalent
+    return {
+        "sale_date": sale_date,
+        "sold_price_mnt": round(sold_price_mnt, 2),
+        "exchange_rate": round(exchange_rate, 4),
+        "cost_rate": round(cost_rate, 4),
+        "rub_equivalent": round(rub_equivalent, 4),
+        "profit_mnt": round(profit_mnt, 2),
+        "note": (payload.get("note") or payload.get("notes") or "").strip() or None,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/api/dashboard/treasury-accounts")
+async def list_treasury_accounts(admin_id: int = None, auth=Depends(get_dashboard_auth)):
+    """List the admin's treasury (balance) accounts (with daily rollover applied)."""
+    client = get_supabase()
+    normalized_admin_id = _validated_dashboard_admin_id(client, admin_id, "admin_id")
+    try:
+        accounts = _dashboard_treasury_balance_payload(client, normalized_admin_id).get("accounts", [])
+    except Exception as exc:
+        raise _dashboard_db_error(exc, "List treasury accounts")
+    return {"accounts": accounts}
+
+
+@app.post("/api/dashboard/treasury-accounts")
+async def create_treasury_account(payload: dict, auth=Depends(get_dashboard_auth)):
+    """Create a treasury account for balance accounting."""
+    client = get_supabase()
+    now = datetime.now(timezone.utc).isoformat()
+    treasury_bank_supported = _treasury_accounts_admin_bank_id_supported(client)
+    if not (payload.get("name") or "").strip():
+        raise HTTPException(status_code=400, detail="Missing required field: name")
+    normalized_admin_id = _validated_dashboard_admin_id(client, payload.get("admin_id"), "admin_id")
+    normalized_admin_bank_id = _validated_admin_bank_account_id(client, payload.get("admin_bank_id"), "admin_bank_id") if treasury_bank_supported else None
+    balance_day = _moscow_today()
+    insert_data = {
+        "name": payload.get("name").strip(),
+        "admin_id": normalized_admin_id,
+        "prev_balance": float(payload.get("prev_balance") or 0),
+        "rub_to_mnt": 0.0,
+        "mnt_to_rub": 0.0,
+        "adjustment": 0.0,
+        "entered_balance": _optional_float(payload.get("entered_balance"), "entered_balance") if "entered_balance" in payload else None,
+        "currency": (payload.get("currency") or "RUB").upper(),
+        "is_active": payload.get("is_active", True),
+        "display_order": int(payload.get("display_order") or 0),
+        "balance_date": balance_day,
+        "created_at": now,
+        "updated_at": now,
+    }
+    if treasury_bank_supported and normalized_admin_bank_id:
+        insert_data["admin_bank_id"] = normalized_admin_bank_id
+    insert_data.update(_treasury_account_transaction_baseline(client, normalized_admin_id, balance_day, admin_bank_id=normalized_admin_bank_id))
+    try:
+        result = client.table("treasury_accounts").insert(insert_data).execute()
+    except Exception as exc:
+        raise _dashboard_db_error(exc, "Create treasury account")
+    if not result.data:
+        raise HTTPException(status_code=500, detail="Failed to create treasury account")
+    created_id = str(result.data[0].get("id"))
+    refreshed = _dashboard_treasury_balance_payload(client, normalized_admin_id).get("accounts", [])
+    account = next((row for row in refreshed if str(row.get("id")) == created_id), result.data[0])
+    return {"ok": True, "account": account}
+
+
+@app.put("/api/dashboard/treasury-accounts/{account_id}")
+async def update_treasury_account(account_id: str, payload: dict, auth=Depends(get_dashboard_auth)):
+    """Update editable treasury-account metadata and entered balance."""
+    client = get_supabase()
+    treasury_bank_supported = _treasury_accounts_admin_bank_id_supported(client)
+    update_data = {"updated_at": datetime.now(timezone.utc).isoformat()}
+    existing_account = None
+    if "admin_id" in payload or "admin_bank_id" in payload:
+        select_fields = "id,admin_id"
+        if treasury_bank_supported:
+            select_fields += ",admin_bank_id"
+        existing_result = client.table("treasury_accounts").select(select_fields).eq("id", account_id).limit(1).execute()
+        existing_account = (existing_result.data or [None])[0]
+        if not existing_account:
+            raise HTTPException(status_code=404, detail="Treasury account not found")
+    if "name" in payload:
+        update_data["name"] = (payload.get("name") or "").strip()
+    normalized_admin_id = _optional_int(existing_account.get("admin_id"), "admin_id") if existing_account else None
+    if "admin_id" in payload:
+        normalized_admin_id = _validated_dashboard_admin_id(client, payload.get("admin_id"), "admin_id")
+        update_data["admin_id"] = normalized_admin_id
+        previous_admin_id = _optional_int(existing_account.get("admin_id"), "admin_id") if existing_account else None
+        if previous_admin_id != normalized_admin_id:
+            update_data.update(_treasury_account_transaction_baseline(client, normalized_admin_id, _moscow_today()))
+    normalized_admin_bank_id = str(existing_account.get("admin_bank_id")) if existing_account and existing_account.get("admin_bank_id") else None
+    if treasury_bank_supported and "admin_bank_id" in payload:
+        normalized_admin_bank_id = _validated_admin_bank_account_id(client, payload.get("admin_bank_id"), "admin_bank_id")
+        update_data["admin_bank_id"] = normalized_admin_bank_id
+    admin_changed = existing_account is not None and _optional_int(existing_account.get("admin_id"), "admin_id") != normalized_admin_id
+    bank_changed = existing_account is not None and str(existing_account.get("admin_bank_id") or "") != str(normalized_admin_bank_id or "")
+    if admin_changed or bank_changed:
+        update_data.update(_treasury_account_transaction_baseline(client, normalized_admin_id, _moscow_today(), admin_bank_id=normalized_admin_bank_id))
+    for num_field in ("display_order",):
+        if num_field in payload:
+            update_data[num_field] = float(payload[num_field] or 0)
+    if "entered_balance" in payload:
+        update_data["entered_balance"] = _optional_float(payload.get("entered_balance"), "entered_balance")
+    if any(k in payload for k in ("admin_id", "entered_balance")):
+        update_data["balance_date"] = _moscow_today()
+    if "currency" in payload:
+        update_data["currency"] = (payload.get("currency") or "RUB").upper()
+    if "is_active" in payload:
+        update_data["is_active"] = bool(payload["is_active"])
+    result = client.table("treasury_accounts").update(update_data).eq("id", account_id).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Treasury account not found")
+    refreshed = _dashboard_treasury_balance_payload(client, normalized_admin_id).get("accounts", [])
+    account = next((row for row in refreshed if str(row.get("id")) == account_id), result.data[0])
+    return {"ok": True, "account": account}
+
+
+@app.get("/api/dashboard/admin-bank-accounts")
+async def list_dashboard_admin_bank_accounts(auth=Depends(get_dashboard_auth)):
+    client = get_supabase()
+    res = (
+        client.table("admin_bank_accounts")
+        .select("id,bank_name,account_number,card_number,phone,owner_name,currency,is_active,is_priority,display_order,admin_id,logo_url,created_at,updated_at")
+        .order("admin_id", desc=False)
+        .order("currency", desc=False)
+        .order("display_order", desc=False)
+        .execute()
+    )
+    accounts = [
+        {
+            "id": str(row.get("id")),
+            "bank_name": row.get("bank_name"),
+            "account_number": row.get("account_number"),
+            "card_number": row.get("card_number"),
+            "phone": row.get("phone"),
+            "owner_name": row.get("owner_name"),
+            "currency": row.get("currency"),
+            "is_active": row.get("is_active", True),
+            "is_priority": row.get("is_priority", False),
+            "display_order": row.get("display_order", 0),
+            "admin_id": row.get("admin_id"),
+            "logo_url": row.get("logo_url"),
+            "created_at": row.get("created_at"),
+            "updated_at": row.get("updated_at"),
+        }
+        for row in (res.data or [])
+    ]
+    return {"accounts": accounts}
+
+
+@app.delete("/api/dashboard/treasury-accounts/{account_id}")
+async def delete_treasury_account(account_id: str, auth=Depends(get_dashboard_auth)):
+    """Delete a treasury account."""
+    client = get_supabase()
+    result = client.table("treasury_accounts").delete().eq("id", account_id).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Treasury account not found")
+    return {"ok": True}
+
+
+@app.put("/api/dashboard/balance/daily")
+async def upsert_dashboard_balance_daily(payload: dict, auth=Depends(get_dashboard_auth)):
+    """Save today's entered closing balance for a specific admin."""
+    client = get_supabase()
+    normalized_admin_id = _validated_dashboard_admin_id(client, payload.get("admin_id"), "admin_id")
+    if normalized_admin_id is None:
+        raise HTTPException(status_code=400, detail="admin_id is required")
+    if "entered_balance" not in payload:
+        raise HTTPException(status_code=400, detail="entered_balance is required")
+    entered_balance = _optional_float(payload.get("entered_balance"), "entered_balance")
+    day = str(payload.get("balance_date") or _moscow_today())[:10]
+
+    admins = _dashboard_scoped_admins(_dashboard_admins(client), normalized_admin_id)
+    try:
+        rows_by_admin = _ensure_dashboard_balance_rows(client, admins, day)
+    except Exception as exc:
+        raise _dashboard_db_error(exc, "Prepare daily balance")
+
+    now = datetime.now(timezone.utc).isoformat()
+    update_payload = {
+        "admin_id": normalized_admin_id,
+        "balance_date": day,
+        "opening_balance": float(rows_by_admin.get(normalized_admin_id, {}).get("opening_balance") or 0),
+        "entered_balance": entered_balance,
+        "updated_at": now,
+    }
+    if normalized_admin_id not in rows_by_admin:
+        update_payload["created_at"] = now
+    try:
+        result = client.table("dashboard_balance_daily").upsert(update_payload, on_conflict="admin_id,balance_date").execute()
+    except Exception as exc:
+        raise _dashboard_db_error(exc, "Save daily balance")
+    row = (result.data or [None])[0]
+    if not row:
+        raise HTTPException(status_code=500, detail="Failed to save daily balance")
+    return {
+        "ok": True,
+        "daily_balance": {
+            **row,
+            "admin_id": normalized_admin_id,
+            "opening_balance": round(float(row.get("opening_balance") or 0), 2),
+            "entered_balance": round(float(row.get("entered_balance") or 0), 2) if row.get("entered_balance") is not None else None,
+        },
+    }
+
+
+@app.post("/api/dashboard/balance/adjustments")
+async def create_dashboard_balance_adjustment(payload: dict, auth=Depends(get_dashboard_auth)):
+    """Create a tagged manual income/expense item for the daily balance calculator."""
+    client = get_supabase()
+    treasury_account_id = str(payload.get("treasury_account_id") or "").strip() or None
+    account_row = None
+    if treasury_account_id:
+        account_result = client.table("treasury_accounts").select("id,name,admin_id").eq("id", treasury_account_id).limit(1).execute()
+        account_row = (account_result.data or [None])[0]
+        if not account_row:
+            raise HTTPException(status_code=400, detail="treasury_account_id is invalid")
+        if account_row.get("admin_id") is None:
+            raise HTTPException(status_code=400, detail="Selected treasury account must be assigned to an admin")
+
+    admin_source = payload.get("admin_id")
+    if admin_source is None and account_row is not None:
+        admin_source = account_row.get("admin_id")
+    normalized_admin_id = _validated_dashboard_admin_id(client, admin_source, "admin_id")
+    if normalized_admin_id is None:
+        raise HTTPException(status_code=400, detail="admin_id is required")
+    if account_row is not None and int(account_row.get("admin_id") or 0) != normalized_admin_id:
+        raise HTTPException(status_code=400, detail="treasury_account_id does not belong to admin_id")
+    amount = _optional_float(payload.get("amount"), "amount")
+    if amount is None:
+        raise HTTPException(status_code=400, detail="amount is required")
+    if abs(amount) < 0.0000001:
+        raise HTTPException(status_code=400, detail="amount must not be 0")
+    day = str(payload.get("balance_date") or _moscow_today())[:10]
+    now = datetime.now(timezone.utc).isoformat()
+    insert_payload = {
+        "admin_id": normalized_admin_id,
+        "treasury_account_id": treasury_account_id,
+        "balance_date": day,
+        "amount": amount,
+        "tag": _normalize_balance_tag(payload.get("tag")),
+        "description": (payload.get("description") or "").strip() or None,
+        "created_at": now,
+        "updated_at": now,
+    }
+    try:
+        result = client.table("dashboard_balance_adjustments").insert(insert_payload).execute()
+    except Exception as exc:
+        raise _dashboard_db_error(exc, "Create balance adjustment")
+    row = (result.data or [None])[0]
+    if not row:
+        raise HTTPException(status_code=500, detail="Failed to create balance adjustment")
+    admin_name = None
+    for admin in _dashboard_admins(client):
+        if admin.get("admin_id") == normalized_admin_id:
+            admin_name = admin.get("name")
+            break
+    return {
+        "ok": True,
+        "adjustment": {
+            **row,
+            "admin_id": normalized_admin_id,
+            "admin_name": admin_name,
+            "treasury_account_id": treasury_account_id,
+            "account_name": account_row.get("name") if account_row else None,
+            "amount": round(float(row.get("amount") or 0), 2),
+        },
+    }
+
+
+@app.delete("/api/dashboard/balance/adjustments/{adjustment_id}")
+async def delete_dashboard_balance_adjustment(adjustment_id: str, auth=Depends(get_dashboard_auth)):
+    """Delete a tagged manual income/expense item from the daily balance calculator."""
+    client = get_supabase()
+    try:
+        result = client.table("dashboard_balance_adjustments").delete().eq("id", adjustment_id).execute()
+    except Exception as exc:
+        raise _dashboard_db_error(exc, "Delete balance adjustment")
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Balance adjustment not found")
+    return {"ok": True}
+
+
+@app.get("/api/dashboard/balance")
+async def dashboard_balance(date: str = None, admin_id: int = None, tz: str = "moscow", auth=Depends(get_dashboard_auth)):
+    """Manual per-account balance calculator scoped to one admin or all admins.
+
+    Previous balance rolls over automatically. RUB→MNT and MNT→RUB are derived
+    from successful transactions for the assigned admin, while tagged other
+    income/expense rows are tracked separately and do not affect the calculated
+    balance. The page aggregates the visible accounts for the selected admin or
+    all admins.
+    """
+    client = get_supabase()
+    tz_key = _dashboard_timezone_key(tz)
+    day = _dashboard_local_day_from_value(date, tz_key) or _dashboard_today(tz_key)
+    normalized_admin_id = _validated_dashboard_admin_id(client, admin_id, "admin_id")
+    try:
+        try:
+            _ensure_dashboard_balance_history_snapshots(client)
+        except Exception as history_exc:
+            logger.warning(f"dashboard balance history snapshot skipped: {history_exc}")
+        payload = _dashboard_treasury_balance_payload(client, normalized_admin_id)
+    except Exception as exc:
+        raise _dashboard_db_error(exc, "Load balance")
+    return payload
+
+
+@app.get("/api/dashboard/balance/history")
+async def dashboard_balance_history(days: int = 30, tz: str = "moscow", auth=Depends(get_dashboard_auth)):
+    client = get_supabase()
+    tz_key = _dashboard_timezone_key(tz)
+    normalized_days = max(1, min(int(days or 30), 180))
+    try:
+        payload = _list_dashboard_balance_history(client, normalized_days)
+    except Exception as exc:
+        raise _dashboard_db_error(exc, "Load balance history")
+    return payload
+
+
+@app.get("/api/dashboard/black-rate")
+async def dashboard_black_rate(start: str = None, end: str = None, date: str = None,
+                               auth=Depends(get_dashboard_auth)):
+    """Read the black rate (black ханш) map from the configured Google Sheet.
+
+    The sheet is filtered to rows where column E (Төлөв) == "Ханш"; the rate is
+    read from column I. `latest`/`latest_date` expose the most recent "Ханш"
+    row so the UI can fall back to it when a specific date has no entry.
+    """
+    s = get_settings()
+    # Echo the (non-secret) config so the UI can diagnose a misconfigured sheet.
+    cfg = {
+        "spreadsheet_id_set": bool(s.black_rate_spreadsheet_id),
+        "service_account_file_set": bool(s.google_sheets_service_account_file),
+        "sheet": s.black_rate_sheet_name,
+        "date_col": s.black_rate_date_column,
+        "rate_col": s.black_rate_rate_column,
+        "status_col": s.black_rate_status_column,
+        "status_value": s.black_rate_status_value,
+    }
+    if not (s.black_rate_spreadsheet_id and s.google_sheets_service_account_file):
+        return {"configured": False, "rates": {}, "latest": None, "latest_date": None,
+                "count": 0, "config": cfg,
+                "error": "Google Sheets is not configured. Set GOOGLE_SHEETS_SERVICE_ACCOUNT_FILE "
+                         "(or GOOGLE_APPLICATION_CREDENTIALS) and BLACK_RATE_SPREADSHEET_ID in the "
+                         "backend .env, then restart."}
+    # The import + fetch are wrapped so a missing module, network, API or parse
+    # error surfaces as a readable message instead of a bare 500.
+    try:
+        from google_sheets import fetch_black_rates
+        rates = fetch_black_rates()
+    except Exception as exc:
+        logger.error(f"black-rate fetch failed: {type(exc).__name__}: {exc}")
+        return {"configured": True, "rates": {}, "latest": None, "latest_date": None,
+                "count": 0, "config": cfg, "error": f"{type(exc).__name__}: {exc}"}
+    # The most recent "Ханш" row (latest date) is the current black rate.
+    latest_date = max(rates) if rates else None
+    latest_val = rates.get(latest_date) if latest_date else None
+    total = len(rates)
+    persisted_count = 0
+    persist_error = None
+    try:
+        persisted_count = _sync_black_rates_into_cost_rates(get_supabase(), rates)
+    except Exception as sync_exc:
+        logger.warning(f"black-rate database sync failed: {sync_exc}")
+        persist_error = str(sync_exc)
+    if total == 0:
+        return {"configured": True, "rates": {}, "latest": None, "latest_date": None,
+                "count": 0, "config": cfg, "persisted_count": persisted_count,
+                "persist_error": persist_error,
+                "error": "No \"Ханш\" rows parsed. Check the tab name, that column E "
+                         "contains \"Ханш\", and that the date/rate columns (B/I) are correct."}
+    if date:
+        return {"configured": True, "rates": {date: rates.get(date)},
+                "latest": latest_val, "latest_date": latest_date, "count": total,
+                "config": cfg, "persisted_count": persisted_count, "persist_error": persist_error}
+    if start or end:
+        lo = start or "0000-00-00"
+        hi = end or "9999-99-99"
+        rates = {k: v for k, v in rates.items() if lo <= k <= hi}
+    return {"configured": True, "rates": rates, "latest": latest_val,
+            "latest_date": latest_date, "count": total, "config": cfg,
+            "persisted_count": persisted_count, "persist_error": persist_error}
+
+
+@app.get("/api/dashboard/cost-rates")
+async def list_cost_rates(start: str = None, end: str = None, tz: str = "moscow", auth=Depends(get_dashboard_auth)):
+    """List stored cost rates (өртөг ханш) within an optional date range."""
+    client = get_supabase()
+    tz_key = _dashboard_timezone_key(tz)
+    start = _dashboard_local_day_from_value(start, tz_key)
+    end = _dashboard_local_day_from_value(end, tz_key)
+    query = client.table("cost_rates").select("*")
+    if start:
+        query = query.gte("rate_date", start)
+    if end:
+        query = query.lte("rate_date", end)
+    try:
+        res = query.order("rate_date", desc=True).execute()
+    except Exception as exc:
+        raise _dashboard_db_error(exc, "List cost rates")
+    return {"cost_rates": res.data or []}
+
+
+@app.post("/api/dashboard/cost-rates")
+async def upsert_cost_rate(payload: dict, auth=Depends(get_dashboard_auth)):
+    """Save a cost rate for a date: cost_rate = usd_rate / black_rate."""
+    client = get_supabase()
+    date_str = (payload.get("date") or payload.get("rate_date") or "").strip()
+    if not date_str:
+        raise HTTPException(status_code=400, detail="Missing required field: date")
+    try:
+        usd_rate = float(payload.get("usd_rate"))
+        black_rate = float(payload.get("black_rate"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="usd_rate and black_rate must be numbers")
+    if black_rate == 0:
+        raise HTTPException(status_code=400, detail="black_rate must not be zero")
+    cost_rate = usd_rate / black_rate
+    row = {
+        "rate_date": date_str,
+        "usd_rate": usd_rate,
+        "black_rate": black_rate,
+        "cost_rate": cost_rate,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        result = client.table("cost_rates").upsert(row, on_conflict="rate_date").execute()
+    except Exception as exc:
+        raise _dashboard_db_error(exc, "Save cost rate")
+    return {"ok": True, "cost_rate": (result.data or [row])[0]}
+
+
+@app.post("/api/dashboard/cost-rates/period-usd")
+async def upsert_cost_rate_period_usd(payload: dict, auth=Depends(get_dashboard_auth)):
+    """Apply one USD rate to every day in a period; keeps per-day black rates."""
+    client = get_supabase()
+    tz_key = _dashboard_timezone_key(payload.get("tz"))
+    start_day = _dashboard_local_day_from_value(payload.get("start") or payload.get("start_date"), tz_key)
+    end_day = _dashboard_local_day_from_value(payload.get("end") or payload.get("end_date"), tz_key)
+    if not start_day or not end_day:
+        raise HTTPException(status_code=400, detail="start and end are required")
+    try:
+        usd_rate = float(payload.get("usd_rate"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="usd_rate must be a number")
+    if usd_rate <= 0:
+        raise HTTPException(status_code=400, detail="usd_rate must be greater than 0")
+
+    days = _dashboard_day_series(start_day, end_day)
+    try:
+        existing_rows = (
+            client.table("cost_rates")
+            .select("rate_date,black_rate")
+            .gte("rate_date", start_day)
+            .lte("rate_date", end_day)
+            .execute()
+            .data
+            or []
+        )
+    except Exception as exc:
+        raise _dashboard_db_error(exc, "Load period cost rates")
+
+    black_by_day = {
+        str(row.get("rate_date") or "")[:10]: (float(row.get("black_rate")) if row.get("black_rate") is not None else None)
+        for row in existing_rows
+    }
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    upserts: list[dict] = []
+    for day in days:
+        black_rate = black_by_day.get(day)
+        cost_rate = (usd_rate / black_rate) if (black_rate not in (None, 0)) else None
+        upserts.append({
+            "rate_date": day,
+            "usd_rate": usd_rate,
+            "black_rate": black_rate,
+            "cost_rate": cost_rate,
+            "updated_at": now_iso,
+        })
+
+    try:
+        _bulk_upsert_cost_rates(client, upserts)
+    except Exception as exc:
+        raise _dashboard_db_error(exc, "Save period USD rates")
+
+    return {
+        "ok": True,
+        "updated_count": len(upserts),
+        "start": start_day,
+        "end": end_day,
+        "usd_rate": usd_rate,
+    }
+
+
+@app.get("/api/dashboard/plane-ticket-sales")
+async def list_plane_ticket_sales(start: str = None, end: str = None, tz: str = "moscow", auth=Depends(get_dashboard_auth)):
+    """List manual plane-ticket sales for the selected window."""
+    tz_key = _dashboard_timezone_key(tz)
+    client = get_supabase()
+    query = client.table("plane_ticket_sales").select("*")
+    start_day = _dashboard_local_day_from_value(start, tz_key)
+    end_day = _dashboard_local_day_from_value(end, tz_key)
+    if start_day:
+        query = query.gte("sale_date", start_day)
+    if end_day:
+        query = query.lte("sale_date", end_day)
+    try:
+        rows = query.order("sale_date", desc=True).order("created_at", desc=True).execute().data or []
+    except Exception as exc:
+        raise _dashboard_db_error(exc, "List plane ticket sales")
+
+    total_profit = sum(float(row.get("profit_mnt") or 0) for row in rows)
+    total_sold = sum(float(row.get("sold_price_mnt") or 0) for row in rows)
+    return {
+        "sales": rows,
+        "summary": {
+            "count": len(rows),
+            "total_profit": round(total_profit, 2),
+            "total_sold_price_mnt": round(total_sold, 2),
+        },
+    }
+
+
+@app.post("/api/dashboard/plane-ticket-sales")
+async def create_plane_ticket_sale(payload: dict, auth=Depends(get_dashboard_auth)):
+    """Create a manual plane-ticket sale row with a required manual exchange rate."""
+    client = get_supabase()
+    now = datetime.now(timezone.utc).isoformat()
+    row = _plane_ticket_sale_row(client, payload)
+    row["created_at"] = now
+    try:
+        result = client.table("plane_ticket_sales").insert(row).execute()
+    except Exception as exc:
+        raise _dashboard_db_error(exc, "Create plane ticket sale")
+    if not result.data:
+        raise HTTPException(status_code=500, detail="Failed to create plane ticket sale")
+    return {"ok": True, "sale": result.data[0]}
+
+
+@app.delete("/api/dashboard/plane-ticket-sales/{sale_id}")
+async def delete_plane_ticket_sale(sale_id: str, auth=Depends(get_dashboard_auth)):
+    """Delete a manual plane-ticket sale row."""
+    client = get_supabase()
+    result = client.table("plane_ticket_sales").delete().eq("id", sale_id).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Plane ticket sale not found")
+    return {"ok": True}
+
+
+@app.get("/api/dashboard/profit/transactions")
+async def dashboard_profit_transactions(
+    start: str = None,
+    end: str = None,
+    tz: str = "moscow",
+    include_tickets: bool = True,
+    auth=Depends(get_dashboard_auth),
+):
+    """Detailed transaction list with per-row profit for the profit calculator window."""
+    import bisect
+
+    client = get_supabase()
+    _dashboard_timezone_key(tz)
+    MAX_ROWS, PAGE = 20000, 1000
+
+    rows: list[dict] = []
+    offset = 0
+    while offset < MAX_ROWS:
+        query = client.table("transactions").select(
+            "invoice,amount,currency_from,currency_to,status,rate,timestamp"
+        )
+        if start:
+            query = query.gte("timestamp", start)
+        if end:
+            query = query.lte("timestamp", end)
+        res = query.order("timestamp", desc=True).range(offset, offset + PAGE - 1).execute()
+        batch = res.data or []
+        rows.extend(batch)
+        if len(batch) < PAGE:
+            break
+        offset += PAGE
+
+    cr_query = client.table("cost_rates").select("rate_date,cost_rate")
+    if end:
+        cr_query = cr_query.lte("rate_date", end[:10])
+    try:
+        cr_data = cr_query.order("rate_date").execute().data or []
+    except Exception as exc:
+        raise _dashboard_db_error(exc, "Load cost rates for profit transactions")
+
+    cr_dates: list[str] = []
+    cr_values: list[float] = []
+    for cr in cr_data:
+        if cr.get("cost_rate") is None:
+            continue
+        cr_dates.append(str(cr["rate_date"])[:10])
+        cr_values.append(float(cr["cost_rate"]))
+
+    def _cost_rate_for(day: str):
+        if not cr_dates or not day:
+            return None
+        idx = bisect.bisect_right(cr_dates, day) - 1
+        return cr_values[idx] if idx >= 0 else None
+
+    items: list[dict] = []
+    for r in rows:
+        if not _is_successful_status(r.get("status")):
+            continue
+        ts = str(r.get("timestamp") or "")
+        day = ts[:10]
+        cost_rate = _cost_rate_for(day)
+        if cost_rate is None:
+            continue
+
+        amount = float(r.get("amount") or 0)
+        rate = float(r.get("rate") or 0)
+        cf = (r.get("currency_from") or "").upper()
+        ct = (r.get("currency_to") or "").upper()
+        direction = None
+        rub_amount = 0.0
+        profit = 0.0
+
+        if cf == "RUB" and ct == "MNT":
+            direction = "buy"
+            rub_amount = amount
+            profit = (cost_rate - rate) * rub_amount
+        elif cf == "MNT" and ct == "RUB":
+            direction = "sell"
+            rub_amount = amount / rate if rate else 0.0
+            profit = (rate - cost_rate) * rub_amount
+        else:
+            continue
+
+        items.append({
+            "invoice_id": r.get("invoice"),
+            "transaction_type": "exchange",
+            "timestamp": ts,
+            "direction": direction,
+            "amount": round(amount, 2),
+            "currency_from": cf,
+            "currency_to": ct,
+            "rate": round(rate, 4),
+            "cost_rate": round(cost_rate, 4),
+            "rub_equivalent": round(rub_amount, 4),
+            "profit_mnt": round(profit, 2),
+            "status": r.get("status"),
+            "note": None,
+        })
+
+    if include_tickets:
+        ticket_query = client.table("plane_ticket_sales").select(
+            "id,sale_date,sold_price_mnt,exchange_rate,cost_rate,rub_equivalent,profit_mnt,note,created_at"
+        )
+        if start:
+            ticket_query = ticket_query.gte("sale_date", start[:10])
+        if end:
+            ticket_query = ticket_query.lte("sale_date", end[:10])
+        try:
+            ticket_rows = ticket_query.order("sale_date", desc=True).execute().data or []
+        except Exception as exc:
+            raise _dashboard_db_error(exc, "Load plane ticket sales for profit transactions")
+
+        for row in ticket_rows:
+            sale_date = str(row.get("sale_date") or "")[:10]
+            ticket_id = str(row.get("id") or "")
+            items.append({
+                "invoice_id": f"TICKET-{ticket_id[:8]}" if ticket_id else "TICKET",
+                "transaction_type": "ticket",
+                "timestamp": row.get("created_at") or (f"{sale_date}T00:00:00+00:00" if sale_date else ""),
+                "direction": "ticket",
+                "amount": round(float(row.get("sold_price_mnt") or 0), 2),
+                "currency_from": "MNT",
+                "currency_to": "RUB",
+                "rate": round(float(row.get("exchange_rate") or 0), 4),
+                "cost_rate": round(float(row.get("cost_rate") or 0), 4),
+                "rub_equivalent": round(float(row.get("rub_equivalent") or 0), 4),
+                "profit_mnt": round(float(row.get("profit_mnt") or 0), 2),
+                "status": "completed",
+                "note": row.get("note"),
+            })
+
+    items.sort(key=lambda row: str(row.get("timestamp") or ""), reverse=True)
+    return {"items": items, "count": len(items)}
+
+
+@app.get("/api/dashboard/profit")
+async def dashboard_profit(start: str = None, end: str = None, tz: str = "moscow", auth=Depends(get_dashboard_auth)):
+    """Profit over a period, joining each transaction's date to its cost rate.
+
+    Direction comes from each transaction's currency_from/currency_to:
+      RUB→MNT (руб/төг):  (cost_rate − rate) × amount
+      MNT→RUB (төг/руб):  (rate − cost_rate) × amount
+    where `rate` and `amount` are that transaction row's own columns and
+    `cost_rate` (өртөг ханш) is the saved cost rate for the transaction's date.
+    Profit is expressed in MNT (₮).
+    """
+    from collections import defaultdict
+    client = get_supabase()
+    MAX_ROWS, PAGE = 20000, 1000
+
+    rows: list[dict] = []
+    offset = 0
+    while offset < MAX_ROWS:
+        query = client.table("transactions").select(
+            "amount,currency_from,currency_to,status,rate,timestamp"
+        )
+        if start:
+            query = query.gte("timestamp", start)
+        if end:
+            query = query.lte("timestamp", end)
+        res = query.order("timestamp", desc=True).range(offset, offset + PAGE - 1).execute()
+        batch = res.data or []
+        rows.extend(batch)
+        if len(batch) < PAGE:
+            break
+        offset += PAGE
+
+    # Cost rates up to the end of the window, oldest→newest. We forward-fill:
+    # a transaction whose date has no cost rate uses the most recent earlier
+    # rate (carried forward until a newer rate appears). No lower bound, so a
+    # rate set before the window can carry into it.
+    import bisect
+    cr_query = client.table("cost_rates").select("rate_date,cost_rate")
+    if end:
+        cr_query = cr_query.lte("rate_date", end[:10])
+    try:
+        cr_data = cr_query.order("rate_date").execute().data or []
+    except Exception as exc:
+        raise _dashboard_db_error(exc, "Load cost rates for profit")
+    cr_dates: list[str] = []
+    cr_values: list[float] = []
+    for cr in cr_data:
+        if cr.get("cost_rate") is None:
+            continue
+        cr_dates.append(str(cr["rate_date"])[:10])
+        cr_values.append(float(cr["cost_rate"]))
+
+    def _cost_rate_for(day: str):
+        """Most recent cost rate on or before `day` (forward-fill), or None."""
+        if not cr_dates or not day:
+            return None
+        idx = bisect.bisect_right(cr_dates, day) - 1
+        return cr_values[idx] if idx >= 0 else None
+
+    total_profit = buy_profit = sell_profit = ticket_profit = 0.0
+    counted = 0
+    ticket_count = 0
+    missing_dates: set[str] = set()
+    by_day: dict[str, dict] = defaultdict(lambda: {"profit": 0.0, "count": 0})
+
+    for r in rows:
+        if not _is_successful_status(r.get("status")):
+            continue
+        ts = r.get("timestamp") or ""
+        day = ts[:10]
+        cost_rate = _cost_rate_for(day)
+        if cost_rate is None:
+            if day:
+                missing_dates.add(day)
+            continue
+        amount = float(r.get("amount", 0) or 0)
+        rate = float(r.get("rate", 0) or 0)
+        cf = (r.get("currency_from") or "").upper()
+        ct = (r.get("currency_to") or "").upper()
+        # Profit is always computed on the RUB amount of the transaction.
+        if cf == "RUB" and ct == "MNT":      # Руб → Төг — amount is already in RUB
+            rub_amount = amount
+            profit = (cost_rate - rate) * rub_amount
+            buy_profit += profit
+        elif cf == "MNT" and ct == "RUB":    # Төг → Руб — convert MNT amount to RUB
+            rub_amount = amount / rate if rate else 0.0
+            profit = (rate - cost_rate) * rub_amount
+            sell_profit += profit
+        else:
+            continue
+        total_profit += profit
+        counted += 1
+        by_day[day]["profit"] += profit
+        by_day[day]["count"] += 1
+
+    ticket_query = client.table("plane_ticket_sales").select("sale_date,profit_mnt")
+    if start:
+        ticket_query = ticket_query.gte("sale_date", start[:10])
+    if end:
+        ticket_query = ticket_query.lte("sale_date", end[:10])
+    try:
+        ticket_rows = ticket_query.order("sale_date").execute().data or []
+    except Exception as exc:
+        raise _dashboard_db_error(exc, "Load plane ticket sales for profit")
+
+    for row in ticket_rows:
+        day = str(row.get("sale_date") or "")[:10]
+        profit = float(row.get("profit_mnt") or 0)
+        ticket_profit += profit
+        total_profit += profit
+        counted += 1
+        ticket_count += 1
+        if day:
+            by_day[day]["profit"] += profit
+            by_day[day]["count"] += 1
+
+    by_day_out = [
+        {"date": d, "profit": round(v["profit"], 2), "count": v["count"]}
+        for d, v in sorted(by_day.items())
+    ]
+    return {
+        "total_profit": round(total_profit, 2),
+        "buy_profit": round(buy_profit, 2),
+        "sell_profit": round(sell_profit, 2),
+        "ticket_profit": round(ticket_profit, 2),
+        "currency": "MNT",
+        "counted": counted,
+        "ticket_count": ticket_count,
+        "by_day": by_day_out,
+        "missing_rate_dates": sorted(missing_dates),
     }
 
 
@@ -3166,6 +5419,8 @@ async def create_exchange(
 
     client = get_supabase()
     _require_service_open(client)
+    admin_bank_supported = _transactions_admin_bank_id_supported(client)
+    normalized_admin_bank_id = _validated_admin_bank_account_id(client, payload.admin_bank_id, "admin_bank_id") if payload.admin_bank_id else None
 
     moscow_tz = ZoneInfo("Europe/Moscow")
     now = datetime.now(moscow_tz)
@@ -3173,6 +5428,12 @@ async def create_exchange(
     direction = payload.direction.lower()
     if direction not in {"buy", "sell"}:
         raise HTTPException(status_code=400, detail="Invalid direction")
+
+    if direction == "sell" and _is_sell_direction_locked_for_reverification(client, user.id):
+        raise HTTPException(
+            status_code=400,
+            detail="MNT->RUB is temporarily unavailable until your bank edit is verified by admin",
+        )
 
     # Always calculate effective rate on backend to keep pricing rules authoritative.
     buy_rate, sell_rate = _load_latest_rates(client)
@@ -3290,6 +5551,8 @@ async def create_exchange(
         "bank_details": payload.bank_details,
         "receipt_submitted_at": now.isoformat() if receipt_paths_list else None,
     }
+    if admin_bank_supported and normalized_admin_bank_id:
+        insert_payload["admin_bank_id"] = normalized_admin_bank_id
 
     # snapshot buy/sell side
     if direction == "buy":
@@ -3392,7 +5655,7 @@ async def get_editable_exchange(
     client = get_supabase()
     res = (
         client.table("transactions")
-        .select("id,invoice,user_id,amount,currency_from,currency_to,rate,promo_code,bank_details,bill_url,receipt_id,status")
+        .select("id,invoice,user_id,amount,currency_from,currency_to,rate,promo_code,bank_details,bill_url,receipt_id,status,admin_bank_id")
         .eq("invoice", invoice)
         .eq("user_id", user.id)
         .limit(1)
@@ -3407,11 +5670,15 @@ async def get_editable_exchange(
 
     direction = "buy" if (trx.get("currency_from") or "").upper() == "RUB" else "sell"
     receipt_urls = _parse_receipt_urls(trx.get("bill_url"), trx.get("receipt_id"))
-    buy_rate, sell_rate = _load_latest_rates(client)
-    base_rate = buy_rate if direction == "buy" else sell_rate
-    if base_rate <= 0:
-        base_rate = _to_decimal(trx.get("rate"))
+    stored_rate = _to_decimal(trx.get("rate"))
     promo_discount, _, _ = _resolve_stored_promo(client, trx.get("promo_code"))
+    base_rate = _derive_waiting_edit_base_rate(
+        direction=direction,
+        stored_rate=stored_rate,
+        promo_discount=promo_discount,
+    )
+    if base_rate <= 0:
+        base_rate = stored_rate
 
     return ExchangeEditableResponse(
         invoice=trx.get("invoice"),
@@ -3419,11 +5686,12 @@ async def get_editable_exchange(
         amount=_to_decimal(trx.get("amount")),
         currency_from=trx.get("currency_from"),
         currency_to=trx.get("currency_to"),
-        rate=_to_decimal(trx.get("rate")),
+        rate=stored_rate,
         base_rate=base_rate,
         promo_discount=promo_discount,
         bank_details=trx.get("bank_details") or "",
         receipt_urls=receipt_urls,
+        admin_bank_id=str(trx.get("admin_bank_id")) if trx.get("admin_bank_id") else None,
         can_edit=True,
     )
 
@@ -3454,17 +5722,33 @@ async def resubmit_exchange(
         raise HTTPException(status_code=400, detail="Transaction cannot be resubmitted")
 
     direction = "buy" if (trx.get("currency_from") or "").upper() == "RUB" else "sell"
-    buy_rate, sell_rate = _load_latest_rates(client)
-    base_rate = buy_rate if direction == "buy" else sell_rate
-    if base_rate <= 0:
-        base_rate = _to_decimal(payload.rate)
-    if base_rate <= 0:
-        raise HTTPException(status_code=400, detail="Rate unavailable")
+    if direction == "sell" and _is_sell_direction_locked_for_reverification(client, user.id):
+        raise HTTPException(
+            status_code=400,
+            detail="MNT->RUB is temporarily unavailable until your bank edit is verified by admin",
+        )
 
+    stored_rate = _to_decimal(trx.get("rate"))
     existing_promo_code = trx.get("promo_code")
     promo_discount = Decimal("0")
     resolved_promo_code: str | None = (str(existing_promo_code).strip() or None) if existing_promo_code else None
     resolved_promo_source: str | None = None
+
+    if existing_promo_code:
+        promo_discount, resolved_promo_code, resolved_promo_source = _resolve_stored_promo(
+            client,
+            existing_promo_code,
+        )
+
+    base_rate = _derive_waiting_edit_base_rate(
+        direction=direction,
+        stored_rate=stored_rate,
+        promo_discount=promo_discount,
+    )
+    if base_rate <= 0:
+        base_rate = _to_decimal(payload.rate)
+    if base_rate <= 0:
+        raise HTTPException(status_code=400, detail="Rate unavailable")
 
     _, preview_source, _, _ = _compute_effective_rate(
         direction=direction,
@@ -3473,11 +5757,10 @@ async def resubmit_exchange(
         promo_discount=Decimal("0"),
     )
 
-    if existing_promo_code and preview_source != "volume":
-        promo_discount, resolved_promo_code, resolved_promo_source = _resolve_stored_promo(
-            client,
-            existing_promo_code,
-        )
+    if preview_source == "volume":
+        promo_discount = Decimal("0")
+        resolved_promo_code = None
+        resolved_promo_source = None
 
     effective_rate, rate_source, _, _ = _compute_effective_rate(
         direction=direction,
@@ -3496,6 +5779,8 @@ async def resubmit_exchange(
 
     bill_url_value = json.dumps(receipt_paths_list) if receipt_paths_list else None
     receipt_id_value = receipt_paths_list[0] if receipt_paths_list else None
+    admin_bank_supported = _transactions_admin_bank_id_supported(client)
+    normalized_admin_bank_id = _validated_admin_bank_account_id(client, payload.admin_bank_id, "admin_bank_id") if payload.admin_bank_id else None
 
     total_paused_seconds = _to_decimal(trx.get("total_paused_seconds"), Decimal("0"))
     paused_at_raw = trx.get("timer_paused_at")
@@ -3525,6 +5810,8 @@ async def resubmit_exchange(
         "timer_paused_at": None,
         "total_paused_seconds": float(total_paused_seconds),
     }
+    if admin_bank_supported and normalized_admin_bank_id:
+        update_payload["admin_bank_id"] = normalized_admin_bank_id
 
     if direction == "buy":
         update_payload["buy_rate"] = str(effective_rate)
@@ -3924,9 +6211,13 @@ async def admin_action(
 @app.get("/api/admin/inbox", response_model=AdminInboxResponse)
 async def admin_inbox(admin=Depends(require_admin)):
     client = get_supabase()
+    admin_bank_supported = _transactions_admin_bank_id_supported(client)
+    select_fields = "invoice,user_id,amount,currency_from,currency_to,status,timestamp,rate,bank_details,receipt_id,bill_url,admin_bill_url,rejection_comment"
+    if admin_bank_supported:
+        select_fields += ",admin_bank_id"
     res = (
         client.table("transactions")
-        .select("invoice,user_id,amount,currency_from,currency_to,status,timestamp,rate,bank_details,receipt_id,bill_url,admin_bill_url,rejection_comment")
+        .select(select_fields)
         .in_("status", ["pending", "approved"])
         .order("timestamp", desc=False)  # Oldest first by default
         .limit(100)
@@ -3948,6 +6239,13 @@ async def admin_inbox(admin=Depends(require_admin)):
                 "admin_label_note": user.get("admin_label_note"),
             }
     
+    # Fetch admin bank accounts for name resolution
+    admin_banks = {}
+    if admin_bank_supported:
+        banks_res = client.table("admin_bank_accounts").select("id,bank_name").execute()
+        for b in banks_res.data or []:
+            admin_banks[str(b.get("id"))] = b.get("bank_name")
+        
     items = []
     for row in res.data or []:
         # Determine direction from currency pair (case-insensitive)
@@ -4023,6 +6321,8 @@ async def admin_inbox(admin=Depends(require_admin)):
             saved_bank_info=saved_bank_info,
             admin_label=user_label,
             admin_label_note=user_label_note,
+            admin_bank_id=str(row.get("admin_bank_id")) if row.get("admin_bank_id") else None,
+            admin_bank_name=admin_banks.get(str(row.get("admin_bank_id"))) if row.get("admin_bank_id") else None,
         ))
     return AdminInboxResponse(items=items)
 
@@ -4060,12 +6360,13 @@ async def admin_history(
 ):
     """Get all transactions with filters for admin history view."""
     client = get_supabase()
+    admin_bank_supported = _transactions_admin_bank_id_supported(client)
     
     # Build query
-    query = client.table("transactions").select(
-        "invoice,user_id,amount,currency_from,currency_to,status,timestamp,rate,bank_details,receipt_id,bill_url,admin_bill_url,rejection_comment,completed_by_admin",
-        count="exact"
-    )
+    select_fields = "invoice,user_id,amount,currency_from,currency_to,status,timestamp,rate,bank_details,receipt_id,bill_url,admin_bill_url,rejection_comment,completed_by_admin"
+    if admin_bank_supported:
+        select_fields += ",admin_bank_id"
+    query = client.table("transactions").select(select_fields, count="exact")
     
     # Apply status filter if provided
     if status and status != "all":
@@ -4087,6 +6388,13 @@ async def admin_history(
                 "bank_rub": u.get("bank_rub"),
             }
     
+    # Fetch admin bank accounts for name resolution
+    admin_banks = {}
+    if admin_bank_supported:
+        banks_res = client.table("admin_bank_accounts").select("id,bank_name").execute()
+        for b in banks_res.data or []:
+            admin_banks[str(b.get("id"))] = b.get("bank_name")
+        
     items = []
     for row in res.data or []:
         direction = "buy" if (row.get("currency_from") or "").upper() == "RUB" else "sell"
@@ -4125,6 +6433,8 @@ async def admin_history(
             rejection_comment=row.get("rejection_comment"),
             direction=direction,
             completed_by_admin=row.get("completed_by_admin"),
+            admin_bank_id=str(row.get("admin_bank_id")) if row.get("admin_bank_id") else None,
+            admin_bank_name=admin_banks.get(str(row.get("admin_bank_id"))) if row.get("admin_bank_id") else None,
         ))
     
     return AdminHistoryResponse(items=items, total=res.count or len(items))
@@ -4217,7 +6527,17 @@ async def admin_kyc_action(
         # Generate one-time welcome promo code ONLY if user has BOTH bank_rub AND bank_mnt filled
         promo_code = None
         try:
-            if has_all_bank_info:
+            existing_welcome_res = (
+                client.table("promo_codes")
+                .select("id", count="exact")
+                .eq("user_id", payload.user_id)
+                .eq("source", "verification")
+                .limit(1)
+                .execute()
+            )
+            has_existing_welcome = (existing_welcome_res.count or 0) > 0
+
+            if has_all_bank_info and not has_existing_welcome:
                 import secrets
                 import string
                 # Generate unique promo code
@@ -4233,6 +6553,8 @@ async def admin_kyc_action(
                 }
                 client.table("promo_codes").insert(promo_payload).execute()
                 logger.info(f"Generated welcome promo code {promo_code} for user {payload.user_id} (has all bank info)")
+            elif has_existing_welcome:
+                logger.info(f"Skipped welcome promo for user {payload.user_id} - already granted before")
             else:
                 logger.info(f"No promo code generated for user {payload.user_id} - missing bank info (RUB: {has_russian_bank}, MNT: {has_mongolian_bank})")
         except Exception as promo_err:

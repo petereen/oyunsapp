@@ -22,17 +22,39 @@ import { fetchMe } from "./api";
 export default function App() {
   const queryParams = new URLSearchParams(window.location.search);
   const rawPath = window.location.pathname;
+  const hostname = window.location.hostname.toLowerCase();
+  const allowedHosts = new Set([
+    "app.oyuns.mn",
+    "dashboard.oyuns.mn",
+    "localhost",
+    "127.0.0.1",
+    "::1",
+  ]);
+  const isAllowedHost = allowedHosts.has(hostname);
   const normalizedPath = rawPath === "/" ? "/" : rawPath.replace(/\/+$/, "");
   const requestedTab = queryParams.get("tab");
   const requestedTournament = queryParams.get("tournament");
   const requestedTournamentSection = queryParams.get("section");
+
+  if (!isAllowedHost) {
+    return (
+      <div className="min-h-screen bg-surface-50 dark:bg-dark-900 flex items-center justify-center p-6">
+        <div className="w-full max-w-md rounded-2xl bg-white dark:bg-dark-800 p-6 text-center shadow-lg">
+          <h1 className="text-xl font-bold text-maroon-700 dark:text-gold-400 mb-2">Unavailable Host</h1>
+          <p className="text-sm text-gray-600 dark:text-gray-300">
+            This app is only available on app.oyuns.mn and dashboard.oyuns.mn.
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   // Standalone tournament admin panel without Telegram auth
   const isOyunsSagsAdmin = normalizedPath === "/oyuns-sags" || normalizedPath === "/omoh-sags";
   if (isOyunsSagsAdmin) return <OyunsSagsAdminPanel />;
 
   // Standalone analytics dashboard without Telegram auth
-  if (normalizedPath === "/dashboard") return <DashboardPanel />;
+  if (hostname === "dashboard.oyuns.mn" || normalizedPath === "/dashboard") return <DashboardPanel />;
 
   // Check URL for fuel admin panel
   const isFuelAdmin = queryParams.has("fuel-admin");
@@ -48,7 +70,7 @@ export default function App() {
     ? requestedTournamentSection
     : "schedule";
 
-  const { initData, user, isAuthenticating, authError, refreshAuth } = useTelegramAuth();
+  const { initData, user, isAuthenticating, authError, clearAuth, refreshAuth, needsBrowserLogin, startBrowserLogin } = useTelegramAuth();
   const { t } = useLang();
   const [view, setView] = useState<"client" | "admin">("client");
   const [activeTab, setActiveTab] = useState(urlOyunsPlusTab ? 3 : urlEditInvoice ? 1 : urlFuelOrderId ? 2 : 0);
@@ -78,6 +100,7 @@ export default function App() {
 
   const isAdmin = profile?.is_admin || false;
   const verificationLevel = profile?.user?.verification_level ?? (profile?.user?.verified ? 2 : profile?.user?.ready_for_verification ? 1 : 0);
+  const effectiveActiveTab = user ? activeTab : 0;
 
   const handleNavigateToTransaction = (direction?: "buy" | "sell", editInvoice?: string) => {
     if (editInvoice) {
@@ -107,6 +130,15 @@ export default function App() {
 
   const handleBackFromProfile = () => {
     setShowProfile(false);
+  };
+
+  const handleLogout = () => {
+    clearAuth();
+    setShowProfile(false);
+    setActiveTab(0);
+    setTransactionDirection(null);
+    setFuelOrderId(null);
+    setEditInvoiceId(null);
   };
 
   const handleNavigateToFuelOrder = (orderId: string) => {
@@ -175,22 +207,24 @@ export default function App() {
 
         {/* Profile Page (overlays tabs) */}
         {showProfile ? (
-          <ProfilePage userId={user?.id} onBack={handleBackFromProfile} />
+          <ProfilePage userId={user?.id} onBack={handleBackFromProfile} onLogout={handleLogout} />
         ) : (
           <>
-            {activeTab === 0 && (
+            {effectiveActiveTab === 0 && (
               <HomeTab
                 initData={initData}
                 user={user}
                 isAuthenticating={isAuthenticating}
                 authError={authError}
+                needsBrowserLogin={needsBrowserLogin}
+                onStartBrowserLogin={startBrowserLogin}
                 onNavigateToTransaction={handleNavigateToTransaction}
                 onNavigateToProfile={handleNavigateToProfile}
                 onNavigateToFuelOrder={handleNavigateToFuelOrder}
                 openEmailVerify={urlVerifyEmail}
               />
             )}
-            {activeTab === 1 && (
+            {user && effectiveActiveTab === 1 && (
               <TransactionTab
                 initData={initData}
                 user={user}
@@ -200,8 +234,8 @@ export default function App() {
                 onEditInvoiceHandled={handleEditInvoiceConsumed}
               />
             )}
-            {activeTab === 2 && <ServicesTab initialFuelOrderId={fuelOrderId} onFuelOrderOpened={() => setFuelOrderId(null)} />}
-            {activeTab === 3 && (
+            {user && effectiveActiveTab === 2 && <ServicesTab initialFuelOrderId={fuelOrderId} onFuelOrderOpened={() => setFuelOrderId(null)} />}
+            {user && effectiveActiveTab === 3 && (
               <OyunsPlusTab
                 userId={user?.id}
                 verificationLevel={verificationLevel}
@@ -212,13 +246,13 @@ export default function App() {
                 initialTournamentInnerTab={urlTournamentInnerTab}
               />
             )}
-            {activeTab === 4 && <StatsTab userId={user?.id} />}
+            {user && effectiveActiveTab === 4 && <StatsTab userId={user?.id} />}
           </>
         )}
       </div>
 
       {/* Bottom Nav */}
-      <BottomNavBar activeTab={activeTab} onTabChange={handleTabChange} />
+      {user && <BottomNavBar activeTab={activeTab} onTabChange={handleTabChange} />}
 
       {/* Diagnostic Helper */}
       <DevToolbar />

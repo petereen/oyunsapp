@@ -12,6 +12,111 @@ const FUEL_ADMIN_KEY_STORAGE = 'fuel_admin_key';
 const OYUNS_SAGS_ADMIN_KEY_STORAGE = 'oyuns_sags_admin_key';
 export const DASHBOARD_KEY_STORAGE = 'oyuns_dashboard_key';
 
+export type AuthenticatedUser = {
+  id: number;
+  first_name?: string;
+  last_name?: string;
+  username?: string;
+};
+
+export type AuthSession = {
+  token: string;
+  user: AuthenticatedUser;
+};
+
+export type TelegramBrowserAuthChallenge = {
+  client_id: string;
+  nonce: string;
+  expires_in: number;
+};
+
+async function parseFetchError(response: Response): Promise<string> {
+  try {
+    const data = await response.json();
+    if (typeof data?.detail === "string" && data.detail.trim()) {
+      return data.detail;
+    }
+  } catch {
+    // Ignore JSON parse failures and fall back to the status text.
+  }
+
+  return response.statusText || `Request failed: ${response.status}`;
+}
+
+export async function authenticateWithTelegramInitData(initData: string): Promise<AuthSession> {
+  const response = await fetch(
+    (import.meta.env.VITE_API_BASE || '/api') + '/auth',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ init_data: initData }),
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(await parseFetchError(response));
+  }
+
+  return response.json();
+}
+
+export async function fetchTelegramBrowserAuthChallenge(): Promise<TelegramBrowserAuthChallenge> {
+  const response = await fetch(
+    (import.meta.env.VITE_API_BASE || '/api') + '/auth/browser/challenge',
+    {
+      method: 'GET',
+      credentials: 'same-origin',
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(await parseFetchError(response));
+  }
+
+  return response.json();
+}
+
+export async function authenticateWithTelegramBrowserIdToken(idToken: string): Promise<AuthSession> {
+  const response = await fetch(
+    (import.meta.env.VITE_API_BASE || '/api') + '/auth/browser',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ id_token: idToken }),
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(await parseFetchError(response));
+  }
+
+  return response.json();
+}
+
+export async function authenticateWithTelegramBrowserCode(payload: {
+  code: string;
+  code_verifier: string;
+  redirect_uri: string;
+}): Promise<AuthSession> {
+  const response = await fetch(
+    (import.meta.env.VITE_API_BASE || '/api') + '/auth/browser/code',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify(payload),
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(await parseFetchError(response));
+  }
+
+  return response.json();
+}
+
 // Fuel admin axios instance - sends API key header for browser-based admin access
 const fuelAdminApi = axios.create({
   baseURL: import.meta.env.VITE_API_BASE || "/api",
@@ -87,33 +192,34 @@ api.interceptors.response.use(
       if (tg?.initData && tg.initData.length > 0) {
         try {
           console.log('🔄 Re-authenticating with Telegram initData...');
-          const authResponse = await fetch(
-            (import.meta.env.VITE_API_BASE || '/api') + '/auth',
-            {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ init_data: tg.initData }),
-            }
-          );
-          
-          if (authResponse.ok) {
-            const authData = await authResponse.json();
-            localStorage.setItem(JWT_STORAGE_KEY, authData.token);
-            localStorage.setItem('oyuns_user_v2', JSON.stringify(authData.user));
-            console.log('✅ Re-authentication successful, retrying original request');
-            
-            // Retry the original request with new token
-            error.config.headers.Authorization = `Bearer ${authData.token}`;
-            return api.request(error.config);
-          }
+          const authData = await authenticateWithTelegramInitData(tg.initData);
+          localStorage.setItem(JWT_STORAGE_KEY, authData.token);
+          localStorage.setItem('oyuns_user_v2', JSON.stringify(authData.user));
+          console.log('✅ Re-authentication successful, retrying original request');
+
+          // Retry the original request with new token
+          error.config.headers.Authorization = `Bearer ${authData.token}`;
+          return api.request(error.config);
         } catch (authError) {
           console.error('❌ Re-authentication failed:', authError);
         }
+      } else {
+        // Browser user (no Telegram context) — retry once with the same token
+        // in case this is a transient server error or deploy-in-progress
+        const storedToken = localStorage.getItem(JWT_STORAGE_KEY);
+        if (storedToken) {
+          console.warn('🔄 Browser 401 — retrying request once before giving up...');
+          try {
+            error.config.headers.Authorization = `Bearer ${storedToken}`;
+            return api.request(error.config);
+          } catch {
+            console.warn('⚠️ Retry also failed, dispatching auth:unauthorized');
+          }
+        }
       }
       
-      // If re-auth failed, clear stored auth and dispatch event
-      localStorage.removeItem(JWT_STORAGE_KEY);
-      localStorage.removeItem('oyuns_user_v2');
+      // Only dispatch unauthorized event — do NOT clear localStorage here.
+      // The auth hook (refreshAuth) will handle state transitions properly.
       window.dispatchEvent(new CustomEvent('auth:unauthorized'));
     }
     
@@ -237,7 +343,7 @@ export type ExchangeCreateInput = {
   receipt_path?: string;
   receipt_paths?: string[]; // Multiple receipt images
   invoice?: string;
-  admin_bank_id?: number;
+  admin_bank_id?: string;
 };
 
 export type PhoneTopupCreateInput = {
@@ -248,7 +354,7 @@ export type PhoneTopupCreateInput = {
   receipt_path?: string;
   receipt_paths?: string[];
   invoice?: string;
-  admin_bank_id?: number;
+  admin_bank_id?: string;
 };
 
 export type ExchangeCreateResponse = {
@@ -460,6 +566,7 @@ export interface ExchangeEditableResponse {
   promo_discount: number;
   bank_details: string;
   receipt_urls: string[];
+  admin_bank_id?: string;
   can_edit: boolean;
 }
 
@@ -485,6 +592,7 @@ export interface ExchangeResubmitInput {
   bank_details: string;
   receipt_path?: string;
   receipt_paths?: string[];
+  admin_bank_id?: string;
 }
 
 export async function resubmitExchange(payload: ExchangeResubmitInput) {
@@ -889,6 +997,8 @@ export interface AdminInboxItem {
   saved_bank_info?: string;
   admin_label?: string;
   admin_label_note?: string;
+  admin_bank_id?: string;
+  admin_bank_name?: string;
 }
 
 export interface AdminInboxResponse {
@@ -921,6 +1031,8 @@ export interface AdminHistoryItem {
   rejection_comment?: string;
   direction?: string;
   completed_by_admin?: number;
+  admin_bank_id?: string;
+  admin_bank_name?: string;
 }
 
 export interface AdminHistoryResponse {
@@ -955,6 +1067,8 @@ export async function adminAction(payload: {
   admin_comment?: string;
   admin_bill_url?: string;
   completed_by_admin?: number;
+  admin_bank_id?: string;
+  admin_bank_name?: string;
 }) {
   const res = await api.post('/admin/action', payload);
   return res.data;
@@ -1104,6 +1218,11 @@ export interface AdminBankAccountFull {
 export async function fetchAllAdminBankAccounts(): Promise<{ accounts: AdminBankAccountFull[] }> {
   const res = await api.get('/admin/bank-accounts');
   return res.data;
+}
+
+export async function fetchDashboardAdminBankAccounts(): Promise<{ accounts: AdminBankAccountFull[] }> {
+  const res = await dashboardApi.get('/dashboard/admin-bank-accounts');
+  return res.data as { accounts: AdminBankAccountFull[] };
 }
 
 export async function createAdminBankAccount(payload: Partial<AdminBankAccountFull>) {
@@ -1644,6 +1763,11 @@ export type DashboardData = {
   truncated: boolean;
 };
 
+export type DashboardAdminOption = {
+  admin_id: number;
+  name: string | null;
+};
+
 export type DashboardStatusFilter = "all" | "successful" | "pending" | "waiting_edit" | "rejected";
 
 export async function verifyDashboardKey(): Promise<boolean> {
@@ -1671,4 +1795,318 @@ export async function fetchDashboardData(params: {
   const query = search.toString();
   const res = await dashboardApi.get(`/dashboard/transactions${query ? `?${query}` : ""}`);
   return res.data as DashboardData;
+}
+
+// --- Dashboard Page 1: Balance accounting + Profit calculator ---
+
+export type TreasuryAccount = {
+  id: string;
+  name: string;
+  admin_id?: number | null;
+  admin_name?: string | null;
+  admin_bank_id?: string | null;
+  admin_bank_name?: string | null;
+  admin_bank_owner?: string | null;
+  admin_bank_currency?: string | null;
+  prev_balance: number;
+  rub_to_mnt: number;
+  mnt_to_rub: number;
+  adjustment: number;
+  adjustment_total?: number;
+  entered_balance?: number | null;
+  calculated_balance?: number;
+  discrepancy?: number | null;
+  balance_date?: string | null;
+  currency: string;
+  is_active: boolean;
+  display_order: number;
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type DailyBalanceRow = {
+  admin_id: number;
+  admin_name: string | null;
+  balance_date: string;
+  opening_balance: number;
+  entered_balance: number | null;
+  rub_to_mnt_rub: number;
+  mnt_to_rub_rub: number;
+  adjustment_total: number;
+  calculated_balance: number;
+  discrepancy: number | null;
+};
+
+export type BalanceHistoryRow = {
+  row_key: string;
+  balance_date: string;
+  scope_type: "all" | "admin";
+  admin_id: number | null;
+  admin_name: string | null;
+  opening_balance: number;
+  rub_to_mnt_rub: number;
+  mnt_to_rub_rub: number;
+  adjustment_total: number;
+  calculated_balance: number;
+  entered_balance: number | null;
+  discrepancy: number | null;
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type BalanceHistoryResponse = {
+  days: string[];
+  rows: BalanceHistoryRow[];
+};
+
+export type BalanceAdjustment = {
+  id: string;
+  admin_id: number;
+  admin_name?: string | null;
+  treasury_account_id?: string | null;
+  account_name?: string | null;
+  balance_date: string;
+  amount: number;
+  tag: string;
+  description?: string | null;
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type BalanceSummary = {
+  date: string;
+  admins: DashboardAdminOption[];
+  selected_admin_id?: number | null;
+  accounts: TreasuryAccount[];
+  daily_balances: DailyBalanceRow[];
+  selected_daily_balance?: DailyBalanceRow | null;
+  adjustments: BalanceAdjustment[];
+  rub_to_mnt_rub: number;
+  mnt_to_rub_rub: number;
+  prev_balance_total: number;
+  adjustment_total: number;
+  total_balance: number;
+  entered_balance_total: number;
+  difference_total: number | null;
+  missing_entered_balance_count: number;
+  setup_required?: boolean;
+  setup_error?: string | null;
+};
+
+export type CostRate = {
+  rate_date: string;
+  usd_rate: number | null;
+  black_rate: number | null;
+  cost_rate: number | null;
+  updated_at?: string;
+};
+
+export type ProfitSummary = {
+  total_profit: number;
+  buy_profit: number;
+  sell_profit: number;
+  ticket_profit: number;
+  currency: string;
+  counted: number;
+  ticket_count: number;
+  by_day: { date: string; profit: number; count: number }[];
+  missing_rate_dates: string[];
+};
+
+export type ProfitTransactionItem = {
+  invoice_id: string | null;
+  transaction_type: "exchange" | "ticket";
+  timestamp: string;
+  direction: "buy" | "sell" | "ticket";
+  amount: number;
+  currency_from: string;
+  currency_to: string;
+  rate: number;
+  cost_rate: number;
+  rub_equivalent: number;
+  profit_mnt: number;
+  status: string | null;
+  note?: string | null;
+};
+
+export type ProfitTransactionsResponse = {
+  items: ProfitTransactionItem[];
+  count: number;
+};
+
+export type PlaneTicketSale = {
+  id: string;
+  sale_date: string;
+  sold_price_mnt: number;
+  exchange_rate: number;
+  cost_rate: number;
+  rub_equivalent: number;
+  profit_mnt: number;
+  note?: string | null;
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type PlaneTicketSalesSummary = {
+  count: number;
+  total_profit: number;
+  total_sold_price_mnt: number;
+};
+
+export type PlaneTicketSalesResponse = {
+  sales: PlaneTicketSale[];
+  summary: PlaneTicketSalesSummary;
+};
+
+export type DashboardTimeZone = "moscow" | "ub";
+
+export async function fetchTreasuryAccounts(): Promise<TreasuryAccount[]> {
+  const res = await dashboardApi.get("/dashboard/treasury-accounts");
+  return (res.data?.accounts || []) as TreasuryAccount[];
+}
+
+export async function createTreasuryAccount(payload: Partial<TreasuryAccount> & { tz?: DashboardTimeZone }): Promise<TreasuryAccount> {
+  const res = await dashboardApi.post("/dashboard/treasury-accounts", payload);
+  return res.data.account as TreasuryAccount;
+}
+
+export async function updateTreasuryAccount(id: string, payload: Partial<TreasuryAccount> & { tz?: DashboardTimeZone }): Promise<TreasuryAccount> {
+  const res = await dashboardApi.put(`/dashboard/treasury-accounts/${id}`, payload);
+  return res.data.account as TreasuryAccount;
+}
+
+export async function deleteTreasuryAccount(id: string): Promise<void> {
+  await dashboardApi.delete(`/dashboard/treasury-accounts/${id}`);
+}
+
+export async function fetchBalanceSummary(params: { date?: string; admin_id?: number; tz?: DashboardTimeZone } = {}): Promise<BalanceSummary> {
+  const search = new URLSearchParams();
+  if (params.date) search.set("date", params.date);
+  if (params.admin_id != null) search.set("admin_id", String(params.admin_id));
+  if (params.tz) search.set("tz", params.tz);
+  const query = search.toString();
+  const res = await dashboardApi.get(`/dashboard/balance${query ? `?${query}` : ""}`);
+  return res.data as BalanceSummary;
+}
+
+export async function upsertBalanceDaily(payload: {
+  admin_id: number;
+  balance_date?: string;
+  entered_balance: number | null;
+}): Promise<DailyBalanceRow> {
+  const res = await dashboardApi.put("/dashboard/balance/daily", payload);
+  return res.data.daily_balance as DailyBalanceRow;
+}
+
+export async function fetchBalanceHistory(params: { days?: number; tz?: DashboardTimeZone } = {}): Promise<BalanceHistoryResponse> {
+  const search = new URLSearchParams();
+  if (params.days != null) search.set("days", String(params.days));
+  if (params.tz) search.set("tz", params.tz);
+  const query = search.toString();
+  const res = await dashboardApi.get(`/dashboard/balance/history${query ? `?${query}` : ""}`);
+  return res.data as BalanceHistoryResponse;
+}
+
+export async function createBalanceAdjustment(payload: {
+  admin_id: number;
+  treasury_account_id?: string;
+  balance_date?: string;
+  amount: number;
+  tag: string;
+  description?: string;
+}): Promise<BalanceAdjustment> {
+  const res = await dashboardApi.post("/dashboard/balance/adjustments", payload);
+  return res.data.adjustment as BalanceAdjustment;
+}
+
+export async function deleteBalanceAdjustment(id: string): Promise<void> {
+  await dashboardApi.delete(`/dashboard/balance/adjustments/${id}`);
+}
+
+export async function fetchBlackRates(params: { start?: string; end?: string; date?: string } = {}): Promise<{
+  configured: boolean; rates: Record<string, number | null>;
+  latest?: number | null; latest_date?: string | null; error?: string;
+}> {
+  const search = new URLSearchParams();
+  if (params.start) search.set("start", params.start);
+  if (params.end) search.set("end", params.end);
+  if (params.date) search.set("date", params.date);
+  const query = search.toString();
+  const res = await dashboardApi.get(`/dashboard/black-rate${query ? `?${query}` : ""}`);
+  return res.data;
+}
+
+export async function fetchCostRates(params: { start?: string; end?: string; tz?: DashboardTimeZone } = {}): Promise<CostRate[]> {
+  const search = new URLSearchParams();
+  if (params.start) search.set("start", params.start);
+  if (params.end) search.set("end", params.end);
+  if (params.tz) search.set("tz", params.tz);
+  const query = search.toString();
+  const res = await dashboardApi.get(`/dashboard/cost-rates${query ? `?${query}` : ""}`);
+  return (res.data?.cost_rates || []) as CostRate[];
+}
+
+export async function saveCostRate(payload: { date: string; usd_rate: number; black_rate: number }): Promise<CostRate> {
+  const res = await dashboardApi.post("/dashboard/cost-rates", payload);
+  return res.data.cost_rate as CostRate;
+}
+
+export async function saveCostRatePeriodUsd(payload: {
+  start: string;
+  end: string;
+  usd_rate: number;
+  tz?: DashboardTimeZone;
+}): Promise<{ ok: boolean; updated_count: number; start: string; end: string; usd_rate: number }> {
+  const res = await dashboardApi.post("/dashboard/cost-rates/period-usd", payload);
+  return res.data;
+}
+
+export async function fetchProfit(params: { start?: string; end?: string; tz?: DashboardTimeZone }): Promise<ProfitSummary> {
+  const search = new URLSearchParams();
+  if (params.start) search.set("start", params.start);
+  if (params.end) search.set("end", params.end);
+  if (params.tz) search.set("tz", params.tz);
+  const query = search.toString();
+  const res = await dashboardApi.get(`/dashboard/profit${query ? `?${query}` : ""}`);
+  return res.data as ProfitSummary;
+}
+
+export async function fetchProfitTransactions(params: {
+  start?: string;
+  end?: string;
+  tz?: DashboardTimeZone;
+  include_tickets?: boolean;
+}): Promise<ProfitTransactionsResponse> {
+  const search = new URLSearchParams();
+  if (params.start) search.set("start", params.start);
+  if (params.end) search.set("end", params.end);
+  if (params.tz) search.set("tz", params.tz);
+  if (params.include_tickets != null) search.set("include_tickets", String(params.include_tickets));
+  const query = search.toString();
+  const res = await dashboardApi.get(`/dashboard/profit/transactions${query ? `?${query}` : ""}`);
+  return res.data as ProfitTransactionsResponse;
+}
+
+export async function fetchPlaneTicketSales(params: { start?: string; end?: string; tz?: DashboardTimeZone } = {}): Promise<PlaneTicketSalesResponse> {
+  const search = new URLSearchParams();
+  if (params.start) search.set("start", params.start);
+  if (params.end) search.set("end", params.end);
+  if (params.tz) search.set("tz", params.tz);
+  const query = search.toString();
+  const res = await dashboardApi.get(`/dashboard/plane-ticket-sales${query ? `?${query}` : ""}`);
+  return res.data as PlaneTicketSalesResponse;
+}
+
+export async function createPlaneTicketSale(payload: {
+  sale_date?: string;
+  sold_price_mnt: number;
+  exchange_rate: number;
+  notes?: string;
+}): Promise<PlaneTicketSale> {
+  const res = await dashboardApi.post("/dashboard/plane-ticket-sales", payload);
+  return res.data.sale as PlaneTicketSale;
+}
+
+export async function deletePlaneTicketSale(id: string): Promise<void> {
+  await dashboardApi.delete(`/dashboard/plane-ticket-sales/${id}`);
 }
