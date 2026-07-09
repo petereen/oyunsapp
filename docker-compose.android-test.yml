@@ -1,0 +1,13 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    env_file:
+      - .env.android-test
+    container_name: oyunsapp-api-test
+    ports:
+      - "${API_HOST_PORT:-8011}:8000"
+    volumes:
+      - ./secrets:/app/secrets:ro
+    restart: unless-stopped
