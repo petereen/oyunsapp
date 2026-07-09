@@ -413,11 +413,12 @@ const DEV_USER: TelegramUser = {
   username: "test_user"
 };
 
-export function useTelegramAuth() {
+export function useTelegramAuth(options?: { enabled?: boolean }) {
+  const enabled = options?.enabled ?? true;
   const lastActivityWriteRef = useRef(0);
   const [state, setState] = useState<AuthState>({
     ...createSignedOutState(),
-    isAuthenticating: true,
+    isAuthenticating: enabled,
   });
 
   const touchActivity = useCallback((force = false) => {
@@ -569,6 +570,11 @@ export function useTelegramAuth() {
   }, [applyAuthenticatedState, requireBrowserLogin]);
 
   useEffect(() => {
+    if (!enabled) {
+      setState(createSignedOutState());
+      return;
+    }
+
     const initAuth = async () => {
       const tg = window.Telegram?.WebApp;
       // Fallback: when telegram-web-app.js fails to load (CDN blocked/closed),
@@ -729,7 +735,7 @@ export function useTelegramAuth() {
     };
 
     initAuth();
-  }, [authenticate, clearStoredAuth, touchActivity]);
+  }, [authenticate, clearStoredAuth, enabled, touchActivity]);
 
   // Function to clear auth (logout)
   const clearAuth = useCallback(() => {

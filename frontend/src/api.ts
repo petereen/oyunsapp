@@ -24,10 +24,19 @@ export type AuthSession = {
   user: AuthenticatedUser;
 };
 
+export type PushDeviceRegisterInput = {
+  token: string;
+  platform: "android" | "ios";
+  device_id?: string;
+  app_version?: string;
+  locale?: string;
+};
+
 export type TelegramBrowserAuthChallenge = {
   client_id: string;
   nonce: string;
   expires_in: number;
+  challenge_token?: string;
 };
 
 async function parseFetchError(response: Response): Promise<string> {
@@ -99,6 +108,7 @@ export async function authenticateWithTelegramBrowserCode(payload: {
   code: string;
   code_verifier: string;
   redirect_uri: string;
+  challenge_token?: string;
 }): Promise<AuthSession> {
   const response = await fetch(
     (import.meta.env.VITE_API_BASE || '/api') + '/auth/browser/code',
@@ -115,6 +125,57 @@ export async function authenticateWithTelegramBrowserCode(payload: {
   }
 
   return response.json();
+}
+
+export async function linkTelegramBrowserCode(payload: {
+  code: string;
+  code_verifier: string;
+  redirect_uri: string;
+  challenge_token: string;
+}): Promise<AuthSession> {
+  const response = await fetch(
+    (import.meta.env.VITE_API_BASE || '/api') + '/auth/link/telegram/code',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify(payload),
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(await parseFetchError(response));
+  }
+
+  return response.json();
+}
+
+export async function authenticateWithNativeAccessToken(accessToken: string): Promise<AuthSession> {
+  const response = await fetch(
+    (import.meta.env.VITE_API_BASE || '/api') + '/auth/native',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ access_token: accessToken }),
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(await parseFetchError(response));
+  }
+
+  return response.json();
+}
+
+export async function registerPushDevice(payload: PushDeviceRegisterInput) {
+  const res = await api.post('/push/register-device', payload);
+  return res.data as { ok: boolean };
+}
+
+export async function unregisterPushDevice(payload: Pick<PushDeviceRegisterInput, 'token'>) {
+  const res = await api.post('/push/unregister-device', payload);
+  return res.data as { ok: boolean };
 }
 
 // Fuel admin axios instance - sends API key header for browser-based admin access

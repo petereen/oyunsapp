@@ -12,7 +12,9 @@ import { ProfilePage } from "./pages/ProfilePage";
 import { OyunsSagsAdminPanel } from "./pages/OyunsSagsAdminPanel";
 import { DashboardPanel } from "./pages/DashboardPanel";
 import { BottomNavBar } from "./components/BottomNavBar";
-import { useTelegramAuth } from "./hooks/useTelegramAuth";
+import { useAppAuth } from "./hooks/useAppAuth";
+import { usePushNotifications } from "./hooks/usePushNotifications";
+import { isNativePlatform } from "./platform";
 import { Shield } from "lucide-react";
 import { TelegramDiagnostic } from "./components/TelegramDiagnostic";
 import { useLang } from "./i18n/useLang";
@@ -30,7 +32,7 @@ export default function App() {
     "127.0.0.1",
     "::1",
   ]);
-  const isAllowedHost = allowedHosts.has(hostname);
+  const isAllowedHost = isNativePlatform() || allowedHosts.has(hostname);
   const normalizedPath = rawPath === "/" ? "/" : rawPath.replace(/\/+$/, "");
   const requestedTab = queryParams.get("tab");
   const requestedTournament = queryParams.get("tournament");
@@ -70,7 +72,22 @@ export default function App() {
     ? requestedTournamentSection
     : "schedule";
 
-  const { initData, user, isAuthenticating, authError, clearAuth, refreshAuth, needsBrowserLogin, startBrowserLogin } = useTelegramAuth();
+  const {
+    initData,
+    user,
+    isAuthenticating,
+    isLinkingTelegram,
+    authError,
+    telegramLinkError,
+    clearAuth,
+    refreshAuth,
+    needsNativeLogin,
+    needsBrowserLogin,
+    startBrowserLogin,
+    linkTelegramAccount,
+    signInWithNativeCredentials,
+    signUpWithNativeCredentials,
+  } = useAppAuth();
   const { t } = useLang();
   const [view, setView] = useState<"client" | "admin">("client");
   const [activeTab, setActiveTab] = useState(urlOyunsPlusTab ? 3 : urlEditInvoice ? 1 : urlFuelOrderId ? 2 : 0);
@@ -78,6 +95,7 @@ export default function App() {
   const [transactionDirection, setTransactionDirection] = useState<"buy" | "sell" | null>(null);
   const [fuelOrderId, setFuelOrderId] = useState<string | null>(urlFuelOrderId);
   const [editInvoiceId, setEditInvoiceId] = useState<string | null>(urlEditInvoice);
+  const { unregisterCurrentDevice } = usePushNotifications(user?.id);
 
   // Listen for auth:unauthorized events and trigger re-authentication
   useEffect(() => {
@@ -133,6 +151,7 @@ export default function App() {
   };
 
   const handleLogout = () => {
+    void unregisterCurrentDevice().catch(() => undefined);
     clearAuth();
     setShowProfile(false);
     setActiveTab(0);
@@ -215,9 +234,15 @@ export default function App() {
                 initData={initData}
                 user={user}
                 isAuthenticating={isAuthenticating}
+                isLinkingTelegram={isLinkingTelegram}
                 authError={authError}
+                telegramLinkError={telegramLinkError}
+                needsNativeLogin={needsNativeLogin}
                 needsBrowserLogin={needsBrowserLogin}
                 onStartBrowserLogin={startBrowserLogin}
+                onLinkTelegram={linkTelegramAccount}
+                onNativeSignIn={signInWithNativeCredentials ? (payload) => signInWithNativeCredentials(payload.email, payload.password) : undefined}
+                onNativeSignUp={signUpWithNativeCredentials}
                 onNavigateToTransaction={handleNavigateToTransaction}
                 onNavigateToProfile={handleNavigateToProfile}
                 onNavigateToFuelOrder={handleNavigateToFuelOrder}

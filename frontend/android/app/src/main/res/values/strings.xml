@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">OYUNS ALL-IN-ONE</string>
+    <string name="title_activity_main">OYUNS ALL-IN-ONE</string>
+    <string name="package_name">mn.oyuns.app</string>
+    <string name="custom_url_scheme">mn.oyuns.app</string>
+</resources>

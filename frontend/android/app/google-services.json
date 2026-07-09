@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "463067394286",
+    "project_id": "oyuns-finance",
+    "storage_bucket": "oyuns-finance.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:463067394286:android:05bd9c996c9753ed3643ff",
+        "android_client_info": {
+          "package_name": "mn.oyuns.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBUeGByFK0Djz5s5xEpay_SyW-yz117HHU"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

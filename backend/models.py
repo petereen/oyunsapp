@@ -25,15 +25,32 @@ class AuthRequest(BaseModel):
     init_data: str = Field(..., description="Telegram initData string")
 
 
+class NativeAuthExchangeRequest(BaseModel):
+    access_token: str = Field(..., description="Supabase access token from native email/password auth")
+
+
 class AuthResponse(BaseModel):
     token: str
     user: AuthenticatedUser
+
+
+class PushDeviceRegisterRequest(BaseModel):
+    token: str
+    platform: str
+    device_id: Optional[str] = None
+    app_version: Optional[str] = None
+    locale: Optional[str] = None
+
+
+class PushDeviceUnregisterRequest(BaseModel):
+    token: str
 
 
 class TelegramBrowserAuthChallengeResponse(BaseModel):
     client_id: str
     nonce: str
     expires_in: int
+    challenge_token: Optional[str] = None
 
 
 class TelegramBrowserAuthRequest(BaseModel):
@@ -44,6 +61,7 @@ class TelegramBrowserCodeAuthRequest(BaseModel):
     code: str = Field(..., description="Telegram OIDC authorization code")
     code_verifier: str = Field(..., description="PKCE code_verifier used for Telegram OIDC")
     redirect_uri: str = Field(..., description="Redirect URI used when opening Telegram OAuth")
+    challenge_token: Optional[str] = Field(None, description="Signed challenge token used for native/mobile Telegram linking")
 
 
 class RateResponse(BaseModel):

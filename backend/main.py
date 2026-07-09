@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse
 from config import get_settings
 from db import get_supabase
 from models import (
+    AuthenticatedUser,
     AdminActionRequest,
     AdminBankAccount,
     AdminBankAccountsResponse,
@@ -40,6 +41,9 @@ from models import (
     AppSettingsUpdateRequest,
     AuthRequest,
     AuthResponse,
+    NativeAuthExchangeRequest,
+    PushDeviceRegisterRequest,
+    PushDeviceUnregisterRequest,
     TelegramBrowserAuthChallengeResponse,
     TelegramBrowserAuthRequest,
     TelegramBrowserCodeAuthRequest,
@@ -777,6 +781,340 @@ def _issue_auth_response(user, settings) -> AuthResponse:
     return AuthResponse(token=token, user=user)
 
 
+def _split_native_profile_name(email: str | None, user_metadata: dict | None) -> tuple[str | None, str | None]:
+    metadata = user_metadata if isinstance(user_metadata, dict) else {}
+    first_name = (metadata.get("first_name") or "").strip() or None
+    last_name = (metadata.get("last_name") or "").strip() or None
+
+    if not first_name:
+        full_name = (metadata.get("full_name") or metadata.get("name") or "").strip()
+        if full_name:
+            name_parts = full_name.split()
+            first_name = name_parts[0]
+            last_name = " ".join(name_parts[1:]) or None
+
+    if not first_name and email:
+        first_name = email.split("@", 1)[0][:80] or None
+
+    return first_name, last_name
+
+
+def _allocate_native_user_id(client) -> int:
+    for _ in range(5):
+        candidate = -(int(datetime.now(timezone.utc).timestamp() * 1_000_000) + secrets.randbelow(1000))
+        exists = client.table("users").select("id").eq("id", candidate).limit(1).execute()
+        if not exists.data:
+            return candidate
+
+    raise HTTPException(status_code=500, detail="Unable to allocate a native user id")
+
+
+def _fetch_supabase_user_by_access_token(access_token: str, settings) -> dict:
+    if not access_token:
+        raise HTTPException(status_code=401, detail="Missing Supabase access token")
+
+    try:
+        response = requests.get(
+            f"{settings.supabase_url.rstrip('/')}/auth/v1/user",
+            headers={
+                "apikey": settings.supabase_key,
+                "Authorization": f"Bearer {access_token}",
+            },
+            timeout=10,
+        )
+    except requests.RequestException as exc:
+        logger.exception("Failed to validate native Supabase session")
+        raise HTTPException(status_code=502, detail="Native authentication service unavailable") from exc
+
+    if response.status_code != 200:
+        raise HTTPException(status_code=401, detail="Invalid native authentication session")
+
+    payload = response.json() or {}
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=401, detail="Invalid native authentication payload")
+
+    return payload
+
+
+def _issue_native_auth_response(access_token: str, settings) -> AuthResponse:
+    client = get_supabase()
+    now = datetime.now(timezone.utc).isoformat()
+    auth_user = _fetch_supabase_user_by_access_token(access_token, settings)
+
+    auth_user_id = str(auth_user.get("id") or "").strip()
+    normalized_email = str(auth_user.get("email") or "").strip().lower()
+    email_confirmed_at = auth_user.get("email_confirmed_at") or auth_user.get("confirmed_at")
+    user_metadata = auth_user.get("user_metadata") if isinstance(auth_user.get("user_metadata"), dict) else {}
+
+    if not auth_user_id:
+        raise HTTPException(status_code=401, detail="Native authentication is missing the user id")
+    if not normalized_email:
+        raise HTTPException(status_code=401, detail="Native authentication is missing the email address")
+    if not email_confirmed_at:
+        raise HTTPException(status_code=401, detail="Email address must be verified before signing in")
+
+    existing = (
+        client.table("users")
+        .select("id,first_name,last_name,email,email_auth_user_id,email_verified_at")
+        .eq("email_auth_user_id", auth_user_id)
+        .limit(1)
+        .execute()
+    )
+    record = existing.data[0] if existing.data else None
+
+    if record:
+        update_payload = {"updated_at": now}
+        if normalized_email and normalized_email != (record.get("email") or "").strip().lower():
+            update_payload["email"] = normalized_email
+
+        first_name, last_name = _split_native_profile_name(normalized_email, user_metadata)
+        if first_name and not record.get("first_name"):
+            update_payload["first_name"] = first_name
+        if last_name and not record.get("last_name"):
+            update_payload["last_name"] = last_name
+        if email_confirmed_at and not record.get("email_verified_at"):
+            update_payload["email_verified_at"] = email_confirmed_at
+
+        client.table("users").update(update_payload).eq("id", record["id"]).execute()
+        record = {**record, **update_payload}
+    else:
+        first_name, last_name = _split_native_profile_name(normalized_email, user_metadata)
+        new_user_id = _allocate_native_user_id(client)
+        record = {
+            "id": new_user_id,
+            "first_name": first_name,
+            "last_name": last_name,
+            "email": normalized_email,
+            "email_auth_user_id": auth_user_id,
+            "email_verified_at": email_confirmed_at,
+            "email_verification_pending": False,
+            "verification_level": 0,
+            "agreed_terms": False,
+            "updated_at": now,
+        }
+        inserted = client.table("users").insert(record).execute()
+        if not inserted.data:
+            raise HTTPException(status_code=500, detail="Failed to create native user account")
+
+    user = AuthenticatedUser(
+        id=int(record["id"]),
+        first_name=record.get("first_name"),
+        last_name=record.get("last_name"),
+        username=None,
+    )
+    return _issue_auth_response(user, settings)
+
+
+def _ensure_telegram_target_row(client, telegram_user: AuthenticatedUser, source_record: dict | None) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    existing = client.table("users").select("id").eq("id", telegram_user.id).limit(1).execute()
+    if existing.data:
+        return
+
+    insert_payload = {
+        "id": telegram_user.id,
+        "first_name": telegram_user.first_name or (source_record or {}).get("first_name"),
+        "last_name": telegram_user.last_name or (source_record or {}).get("last_name"),
+        "updated_at": now,
+    }
+
+    if source_record and source_record.get("created_at"):
+        insert_payload["created_at"] = source_record.get("created_at")
+
+    client.table("users").insert(insert_payload).execute()
+
+
+def _merge_oyuns_plus_rows(client, source_user_id: int, target_user_id: int) -> None:
+    rows = (
+        client.table("oyuns_plus_points_ledger")
+        .select("id,source_type,source_id")
+        .eq("user_id", source_user_id)
+        .execute()
+        .data
+        or []
+    )
+
+    for row in rows:
+        duplicate = (
+            client.table("oyuns_plus_points_ledger")
+            .select("id")
+            .eq("user_id", target_user_id)
+            .eq("source_type", row.get("source_type"))
+            .eq("source_id", row.get("source_id"))
+            .limit(1)
+            .execute()
+        )
+        if duplicate.data:
+            client.table("oyuns_plus_points_ledger").delete().eq("id", row["id"]).execute()
+        else:
+            client.table("oyuns_plus_points_ledger").update({"user_id": target_user_id}).eq("id", row["id"]).execute()
+
+
+def _merge_tournament_votes(client, source_user_id: int, target_user_id: int) -> None:
+    rows = (
+        client.table("oyuns_tournament_votes")
+        .select("id,category")
+        .eq("user_id", source_user_id)
+        .execute()
+        .data
+        or []
+    )
+
+    for row in rows:
+        duplicate = (
+            client.table("oyuns_tournament_votes")
+            .select("id")
+            .eq("user_id", target_user_id)
+            .eq("category", row.get("category"))
+            .limit(1)
+            .execute()
+        )
+        if duplicate.data:
+            client.table("oyuns_tournament_votes").delete().eq("id", row["id"]).execute()
+        else:
+            client.table("oyuns_tournament_votes").update({"user_id": target_user_id}).eq("id", row["id"]).execute()
+
+
+def _reassign_user_references(client, source_user_id: int, target_user_id: int) -> None:
+    simple_updates: list[tuple[str, str, dict[str, object] | None]] = [
+        ("transactions", "user_id", None),
+        ("fuel_orders", "user_id", None),
+        ("push_device_tokens", "user_id", None),
+        ("users", "referred_by_user_id", None),
+        ("gifts", "sender_user_id", None),
+        ("gifts", "recipient_user_id", None),
+        ("promo_codes", "user_id", None),
+    ]
+
+    for table_name, column_name, filters in simple_updates:
+        query = client.table(table_name).update({column_name: target_user_id})
+        if filters:
+            for filter_key, filter_value in filters.items():
+                query = query.eq(filter_key, filter_value)
+        query.eq(column_name, source_user_id).execute()
+
+    client.table("fuel_chat_messages").update({"sender_id": target_user_id}).eq("sender_type", "user").eq("sender_id", source_user_id).execute()
+    _merge_oyuns_plus_rows(client, source_user_id, target_user_id)
+    _merge_tournament_votes(client, source_user_id, target_user_id)
+
+
+def _build_linked_user_payload(
+    source_record: dict,
+    target_record: dict | None,
+    telegram_user: AuthenticatedUser,
+    now_iso: str,
+) -> dict:
+    source = source_record or {}
+    target = target_record or {}
+
+    verification_level = max(
+        _safe_int(source.get("verification_level"), 0),
+        _safe_int(target.get("verification_level"), 0),
+    )
+
+    return {
+        "first_name": target.get("first_name") or telegram_user.first_name or source.get("first_name"),
+        "last_name": target.get("last_name") or telegram_user.last_name or source.get("last_name"),
+        "email": source.get("email") or target.get("email"),
+        "phone": target.get("phone") or source.get("phone"),
+        "phone_mnt": target.get("phone_mnt") or source.get("phone_mnt"),
+        "phone_intl": target.get("phone_intl") or source.get("phone_intl"),
+        "bank_rub": target.get("bank_rub") or source.get("bank_rub"),
+        "bank_mnt": target.get("bank_mnt") or source.get("bank_mnt"),
+        "passport_storage_url": target.get("passport_storage_url") or source.get("passport_storage_url"),
+        "ready_for_verification": bool(target.get("ready_for_verification")) or bool(source.get("ready_for_verification")),
+        "verified": bool(target.get("verified")) or bool(source.get("verified")),
+        "agreed_terms": bool(target.get("agreed_terms")) or bool(source.get("agreed_terms")),
+        "email_verification_pending": False,
+        "email_verified_at": source.get("email_verified_at") or target.get("email_verified_at"),
+        "email_auth_user_id": source.get("email_auth_user_id") or target.get("email_auth_user_id"),
+        "lang": target.get("lang") or source.get("lang"),
+        "verification_level": verification_level,
+        "referral_code": target.get("referral_code") or source.get("referral_code"),
+        "referred_by_user_id": target.get("referred_by_user_id") or source.get("referred_by_user_id"),
+        "referred_by_code": target.get("referred_by_code") or source.get("referred_by_code"),
+        "updated_at": now_iso,
+    }
+
+
+def _finalize_merged_source_row(client, source_user_id: int) -> None:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        client.table("users").delete().eq("id", source_user_id).execute()
+    except Exception as exc:
+        logger.warning("Failed to delete merged native user %s, clearing auth binding instead: %s", source_user_id, exc)
+        client.table("users").update({
+            "email_auth_user_id": None,
+            "updated_at": now_iso,
+        }).eq("id", source_user_id).execute()
+
+
+def _link_native_user_to_telegram_account(
+    current_user: AuthenticatedUser,
+    telegram_user: AuthenticatedUser,
+    settings,
+) -> AuthResponse:
+    client = get_supabase()
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    if current_user.id > 0 and current_user.id != telegram_user.id:
+        raise HTTPException(status_code=409, detail="Current session is already linked to a different Telegram account")
+
+    source_res = client.table("users").select("*").eq("id", current_user.id).limit(1).execute()
+    source_record = source_res.data[0] if source_res.data else None
+    if not source_record:
+        raise HTTPException(status_code=404, detail="Current native user record not found")
+
+    if not source_record.get("email_auth_user_id"):
+        raise HTTPException(status_code=400, detail="Current account is not backed by native email authentication")
+
+    if current_user.id == telegram_user.id:
+        update_payload = {
+            "updated_at": now_iso,
+            "first_name": source_record.get("first_name") or telegram_user.first_name,
+            "last_name": source_record.get("last_name") or telegram_user.last_name,
+        }
+        client.table("users").update(update_payload).eq("id", current_user.id).execute()
+        return _issue_auth_response(
+            AuthenticatedUser(
+                id=current_user.id,
+                first_name=update_payload.get("first_name"),
+                last_name=update_payload.get("last_name"),
+                username=telegram_user.username,
+            ),
+            settings,
+        )
+
+    target_res = client.table("users").select("*").eq("id", telegram_user.id).limit(1).execute()
+    target_record = target_res.data[0] if target_res.data else None
+
+    existing_target_auth_user_id = str(target_record.get("email_auth_user_id") or "").strip() if target_record else ""
+    source_auth_user_id = str(source_record.get("email_auth_user_id") or "").strip()
+    if existing_target_auth_user_id and existing_target_auth_user_id != source_auth_user_id:
+        raise HTTPException(status_code=409, detail="This Telegram account is already linked to a different native account")
+
+    _ensure_telegram_target_row(client, telegram_user, source_record)
+    _reassign_user_references(client, current_user.id, telegram_user.id)
+
+    refreshed_target = client.table("users").select("*").eq("id", telegram_user.id).limit(1).execute().data
+    target_record = refreshed_target[0] if refreshed_target else target_record
+    merged_payload = _build_linked_user_payload(source_record, target_record, telegram_user, now_iso)
+    client.table("users").update(merged_payload).eq("id", telegram_user.id).execute()
+
+    _ensure_user_referral_code(client, telegram_user.id)
+    _finalize_merged_source_row(client, current_user.id)
+
+    return _issue_auth_response(
+        AuthenticatedUser(
+            id=telegram_user.id,
+            first_name=merged_payload.get("first_name"),
+            last_name=merged_payload.get("last_name"),
+            username=telegram_user.username,
+        ),
+        settings,
+    )
+
+
 @app.get("/api/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
     return HealthResponse()
@@ -827,6 +1165,77 @@ async def authenticate(payload: AuthRequest):
         raise HTTPException(status_code=401, detail=str(exc)) from exc
 
 
+@app.post("/api/auth/native", response_model=AuthResponse)
+async def authenticate_native(payload: NativeAuthExchangeRequest):
+    settings = get_settings()
+    return _issue_native_auth_response(payload.access_token, settings)
+
+
+@app.post("/api/push/register-device")
+async def register_push_device(
+    payload: PushDeviceRegisterRequest,
+    user=Depends(get_jwt_authenticated_user),
+):
+    client = get_supabase()
+    now = datetime.now(timezone.utc).isoformat()
+    token = payload.token.strip()
+    platform = payload.platform.strip().lower()
+
+    if not token:
+        raise HTTPException(status_code=400, detail="Push token is required")
+    if platform not in {"android", "ios"}:
+        raise HTTPException(status_code=400, detail="Push platform must be android or ios")
+
+    update_payload = {
+        "user_id": user.id,
+        "platform": platform,
+        "token": token,
+        "device_id": payload.device_id,
+        "app_version": payload.app_version,
+        "locale": payload.locale,
+        "is_active": True,
+        "updated_at": now,
+        "last_seen_at": now,
+    }
+
+    existing = (
+        client.table("push_device_tokens")
+        .select("id")
+        .eq("token", token)
+        .limit(1)
+        .execute()
+    )
+
+    if existing.data:
+        client.table("push_device_tokens").update(update_payload).eq("id", existing.data[0]["id"]).execute()
+    else:
+        client.table("push_device_tokens").insert({
+            **update_payload,
+            "created_at": now,
+        }).execute()
+
+    return {"ok": True}
+
+
+@app.post("/api/push/unregister-device")
+async def unregister_push_device(
+    payload: PushDeviceUnregisterRequest,
+    user=Depends(get_jwt_authenticated_user),
+):
+    token = payload.token.strip()
+    if not token:
+        return {"ok": True}
+
+    client = get_supabase()
+    now = datetime.now(timezone.utc).isoformat()
+    client.table("push_device_tokens").update({
+        "is_active": False,
+        "updated_at": now,
+    }).eq("user_id", user.id).eq("token", token).execute()
+
+    return {"ok": True}
+
+
 @app.get("/api/auth/browser/challenge", response_model=TelegramBrowserAuthChallengeResponse)
 async def browser_auth_challenge(request: Request, response: Response):
     settings = get_settings()
@@ -858,6 +1267,7 @@ async def browser_auth_challenge(request: Request, response: Response):
         client_id=client_id,
         nonce=nonce,
         expires_in=settings.telegram_login_nonce_ttl_seconds,
+        challenge_token=challenge,
     )
 
 
@@ -948,6 +1358,42 @@ async def authenticate_browser_code(payload: TelegramBrowserCodeAuthRequest, req
             path="/",
         )
         logger.warning(f"Telegram browser code authentication failed: {exc}")
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+
+
+@app.post("/api/auth/link/telegram/code", response_model=AuthResponse)
+async def link_telegram_account_with_code(
+    payload: TelegramBrowserCodeAuthRequest,
+    current_user=Depends(get_jwt_authenticated_user),
+):
+    settings = get_settings()
+    client_id = (settings.telegram_login_client_id or "").strip()
+    client_secret = (settings.telegram_login_client_secret or "").strip()
+
+    if not client_id:
+        raise HTTPException(status_code=503, detail="Telegram browser login is not configured")
+    if not client_secret:
+        raise HTTPException(status_code=503, detail="Telegram browser login client secret is not configured")
+    if not payload.challenge_token:
+        raise HTTPException(status_code=401, detail="Missing Telegram link challenge")
+
+    try:
+        expected_nonce = verify_telegram_login_challenge(payload.challenge_token, settings.jwt_secret)
+        id_token = exchange_telegram_login_code_for_id_token(
+            code=payload.code,
+            client_id=client_id,
+            client_secret=client_secret,
+            code_verifier=payload.code_verifier,
+            redirect_uri=payload.redirect_uri,
+        )
+        telegram_user, received_nonce = verify_telegram_login_id_token(id_token, client_id)
+
+        if not received_nonce or received_nonce != expected_nonce:
+            raise TelegramLoginError("Telegram login nonce mismatch")
+
+        return _link_native_user_to_telegram_account(current_user, telegram_user, settings)
+    except TelegramLoginError as exc:
+        logger.warning("Telegram link via code failed: %s", exc)
         raise HTTPException(status_code=401, detail=str(exc)) from exc
 
 

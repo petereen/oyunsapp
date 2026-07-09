@@ -1,7 +1,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import oyunsIcon from "../assets/oyuns-icon.png";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { User, UserPlus, ArrowDownLeft, ArrowUpRight, ArrowLeftRight, Loader2, Clock, AlertCircle, Sun, Moon, Mail, LogIn, LogOut } from "lucide-react";
+import { User, UserPlus, ArrowDownLeft, ArrowUpRight, ArrowLeftRight, Loader2, Clock, AlertCircle, Sun, Moon, Mail, LogIn, LogOut, Link2 } from "lucide-react";
 import { Converter } from "../components/Converter";
 import { RateCard } from "../components/RateCard";
 import { RateHistoryChart } from "../components/RateHistoryChart";
@@ -13,18 +13,24 @@ import { RegistrationModal } from "../components/RegistrationModal";
 import { QuickRegistrationModal } from "../components/QuickRegistrationModal";
 import { EmailVerificationModal } from "../components/EmailVerificationModal";
 import { RequiredInfoModal } from "../components/RequiredInfoModal";
-import { fetchAppSettings, fetchRates, fetchMe, fetchOyunsPlusSummary, fetchServiceStatus } from "../api";
-import { TelegramUser } from "../hooks/useTelegramAuth";
+import { NativeAuthCard } from "../components/NativeAuthCard";
+import { fetchAppSettings, fetchRates, fetchMe, fetchOyunsPlusSummary, fetchServiceStatus, type AuthenticatedUser } from "../api";
 import { useTheme } from "../hooks/useTheme";
 import { useLang } from "../i18n/useLang";
 
 interface Props {
   initData: string;
-  user: TelegramUser | null;
+  user: AuthenticatedUser | null;
   isAuthenticating?: boolean;
+  isLinkingTelegram?: boolean;
   authError?: string | null;
+  telegramLinkError?: string | null;
+  needsNativeLogin?: boolean;
   needsBrowserLogin?: boolean;
   onStartBrowserLogin?: () => void;
+  onLinkTelegram?: () => Promise<unknown>;
+  onNativeSignIn?: (payload: { email: string; password: string }) => Promise<unknown>;
+  onNativeSignUp?: (payload: { email: string; password: string; firstName: string; lastName: string }) => Promise<unknown>;
   onLogout?: () => void;
   onNavigateToTransaction: (direction?: "buy" | "sell", editInvoice?: string) => void;
   onNavigateToProfile: () => void;
@@ -32,7 +38,7 @@ interface Props {
   openEmailVerify?: boolean;
 }
 
-export function HomeTab({ initData, user, isAuthenticating, authError, needsBrowserLogin = false, onStartBrowserLogin, onLogout, onNavigateToTransaction, onNavigateToProfile, onNavigateToFuelOrder, openEmailVerify = false }: Props) {
+export function HomeTab({ initData, user, isAuthenticating, isLinkingTelegram = false, authError, telegramLinkError, needsNativeLogin = false, needsBrowserLogin = false, onStartBrowserLogin, onLinkTelegram, onNativeSignIn, onNativeSignUp, onLogout, onNavigateToTransaction, onNavigateToProfile, onNavigateToFuelOrder, openEmailVerify = false }: Props) {
   const queryClient = useQueryClient();
   const { theme, toggleTheme } = useTheme();
   const { lang, setLang, t } = useLang();
@@ -93,7 +99,12 @@ export function HomeTab({ initData, user, isAuthenticating, authError, needsBrow
   const [showEmailVerification, setShowEmailVerification] = useState(false);
   const [showKycRegistration, setShowKycRegistration] = useState(false);
   const [showRequiredInfo, setShowRequiredInfo] = useState(false);
+  const [hideTelegramLinkPrompt, setHideTelegramLinkPrompt] = useState(false);
   const [direction, setDirection] = useState<"buy" | "sell">("buy");
+
+  useEffect(() => {
+    setHideTelegramLinkPrompt(false);
+  }, [user?.id]);
 
   const handleRegistered = () => {
     queryClient.invalidateQueries({ queryKey: ["me", user?.id] });
@@ -155,6 +166,7 @@ export function HomeTab({ initData, user, isAuthenticating, authError, needsBrow
   }, [appSettings?.home_banner_link_url]);
   const showHomeBanner = (appSettings?.home_banner_enabled ?? 0) > 0 && Boolean(homeBannerImageUrl);
   const showBrowserLogout = Boolean(user?.id) && Boolean(onLogout) && !initData;
+  const showTelegramLinkPrompt = Boolean(user?.id && user.id < 0 && !hideTelegramLinkPrompt);
 
   const handleHomeBannerClick = () => {
     if (!homeBannerLinkUrl) return;
@@ -190,6 +202,17 @@ export function HomeTab({ initData, user, isAuthenticating, authError, needsBrow
         <div className="text-lg font-medium text-dark-800 dark:text-ivory-200">{t("home.logging_in")}</div>
         <div className="text-sm text-dark-600 dark:text-ivory-300">{t("home.please_wait")}</div>
       </div>
+    );
+  }
+
+  if (needsNativeLogin) {
+    return (
+      <NativeAuthCard
+        isLoading={Boolean(isAuthenticating)}
+        error={authError}
+        onSignIn={onNativeSignIn}
+        onSignUp={onNativeSignUp}
+      />
     );
   }
 
@@ -347,6 +370,57 @@ export function HomeTab({ initData, user, isAuthenticating, authError, needsBrow
       {user?.id && isVerified && <GiftStatusTracker userId={user.id} />}
       {user?.id && isBasicRegistered && <FuelStatusTracker userId={user.id} onOpenOrder={onNavigateToFuelOrder} />}
       {user?.id && isVerified && <PendingGiftBanner onGiftConfirmed={() => queryClient.invalidateQueries({ queryKey: ["me", user?.id] })} />}
+
+      {showTelegramLinkPrompt && (
+        <div className="bg-white dark:bg-dark-800 p-5 rounded-3xl shadow-card border border-sky-200 dark:border-sky-800 animate-slideUp">
+          <div className="flex items-center gap-4 mb-4">
+            <div className="w-12 h-12 bg-sky-50 dark:bg-sky-900/30 rounded-2xl flex items-center justify-center flex-shrink-0">
+              <Link2 className="w-6 h-6 text-sky-600 dark:text-sky-300" />
+            </div>
+            <div>
+              <div className="text-sm font-bold text-dark-800 dark:text-ivory-200 mb-0.5">{t("home.telegram_link_title")}</div>
+              <div className="text-xs text-dark-600 dark:text-ivory-300">{t("home.telegram_link_desc")}</div>
+              <div className="text-[11px] text-dark-500 dark:text-ivory-400 mt-1">{t("home.telegram_link_note")}</div>
+            </div>
+          </div>
+
+          {telegramLinkError && (
+            <div className="mb-3 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-900/40 dark:bg-red-950/30 dark:text-red-300">
+              {telegramLinkError}
+            </div>
+          )}
+
+          <button
+            onClick={() => {
+              if (!onLinkTelegram) {
+                return;
+              }
+              void onLinkTelegram();
+            }}
+            disabled={!onLinkTelegram || isLinkingTelegram}
+            className="w-full inline-flex items-center justify-center gap-2 rounded-2xl bg-sky-600 px-5 py-3 text-sm font-semibold text-white shadow-card transition hover:bg-sky-500 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {isLinkingTelegram ? (
+              <>
+                <Loader2 className="w-4 h-4 animate-spin" />
+                {t("home.telegram_link_loading")}
+              </>
+            ) : (
+              <>
+                <Link2 className="w-4 h-4" />
+                {t("home.telegram_link_button")}
+              </>
+            )}
+          </button>
+
+          <button
+            onClick={() => setHideTelegramLinkPrompt(true)}
+            className="w-full mt-2 text-xs text-dark-500 dark:text-ivory-400 hover:text-dark-700 dark:hover:text-ivory-200 transition"
+          >
+            {t("home.telegram_link_skip")}
+          </button>
+        </div>
+      )}
 
       {/* Profile Error */}
       {profileError && (
